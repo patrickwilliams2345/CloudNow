@@ -1,0 +1,1 @@
+{"git_oid":"5b8ffd5ecf95090dd91dce4500161a230b24feb1","parent_oid":"dd69176b76281a739d8b69ad66244376cf53e275","ai_metadata":{"model_name":"unknown","prompt":"Fix CloudNow CI archive failure by selecting Xcode 16.4 and setting supported tvOS deployment target","agent_id":"codex","usage":null},"test_metrics":null,"ast_hashes":null,"timestamp":"2026-06-05T18:52:22.472008Z"}
