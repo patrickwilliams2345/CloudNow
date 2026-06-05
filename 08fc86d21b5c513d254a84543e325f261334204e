@@ -1,0 +1,1 @@
+{"git_oid":"08fc86d21b5c513d254a84543e325f261334204e","parent_oid":"c70e4aba0c9d9c0e74672126fc119d66110d77a5","ai_metadata":{"model_name":"unknown","prompt":"Fix CloudNow GitHub Actions workflow validation failure caused by secrets in if conditionals","agent_id":"codex","usage":null},"test_metrics":null,"ast_hashes":null,"timestamp":"2026-06-05T18:04:31.878736Z"}
