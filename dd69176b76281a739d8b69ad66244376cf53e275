@@ -1,0 +1,1 @@
+{"git_oid":"dd69176b76281a739d8b69ad66244376cf53e275","parent_oid":"08fc86d21b5c513d254a84543e325f261334204e","ai_metadata":{"model_name":"unknown","prompt":"Fix CloudNow CI Xcode archive failure by awaiting MainActor AuthManager.session reads in GamesViewModel","agent_id":"codex","usage":null},"test_metrics":null,"ast_hashes":null,"timestamp":"2026-06-05T18:45:26.416073Z"}
