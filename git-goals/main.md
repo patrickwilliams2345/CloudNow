@@ -1,0 +1,1 @@
+Fix CloudNow GitHub Actions workflow validation failure
