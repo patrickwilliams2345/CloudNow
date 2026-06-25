@@ -7,6 +7,9 @@ import AVFoundation
 import Foundation
 @preconcurrency import LiveKitWebRTC
 import Observation
+import os.log
+
+private let gfnLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "GFNStream")
 
 // MARK: - Session Time Warning
 
@@ -24,8 +27,10 @@ enum StreamState: Equatable {
     case idle
     case connecting
     case streaming
+    case reconnecting(attempt: Int)
     case disconnected(reason: String)
     case failed(message: String)
+    case sessionEnded
 }
 
 // MARK: - Stream Statistics
@@ -40,6 +45,29 @@ struct StreamStats {
     var jitterMs: Double = 0
     var codec: String = ""
     var gpuType: String = ""
+    var jitterBufferDelayMs: Double = 0
+    var jitterBufferTargetDelayMs: Double = 0
+    var jitterBufferMinimumDelayMs: Double = 0
+    var decodeTimeMs: Double = 0
+    var processingDelayMs: Double = 0
+    var framesDropped: Int = 0
+    var freezeCount: Int = 0
+    var freezeDurationMs: Double = 0
+    var nackCount: Int = 0
+    var pliCount: Int = 0
+    var firCount: Int = 0
+    var retransmittedPackets: Int = 0
+    var decoderImplementation: String = ""
+    var powerEfficientDecoder: Bool?
+    var selectedCandidatePairId: String = ""
+    var selectedProtocol: String = ""
+    var localCandidateType: String = ""
+    var remoteCandidateType: String = ""
+    var localCandidateAddress: String = ""
+    var remoteCandidateAddress: String = ""
+    var availableIncomingBitrateKbps: Int = 0
+    var candidatePairChanges: Int = 0
+    var selectedNetworkPath: String = "Unknown"
     var inputGenerated: UInt64 = 0
     var inputSubmitted: UInt64 = 0
     var inputAccepted: UInt64 = 0
@@ -50,8 +78,45 @@ struct StreamStats {
     var inputQueueMaxMs: Double = 0
     var newestGamepadAgeMs: Double = 0
     var inputChannelState: String = "closed"
-    var selectedNetworkPath: String = "Unknown"
 }
+
+private struct VideoStatsSnapshot {
+    var timestampUs: Double = 0
+    var bytesReceived: Double = 0
+    var packetsReceived: Double = 0
+    var packetsLost: Double = 0
+    var framesDecoded: Double = 0
+    var framesDropped: Double = 0
+    var framesPerSecond: Double = 0
+    var frameWidth: Double = 0
+    var frameHeight: Double = 0
+    var jitterSeconds: Double = 0
+    var jitterBufferDelaySeconds: Double = 0
+    var jitterBufferTargetDelaySeconds: Double = 0
+    var jitterBufferMinimumDelaySeconds: Double = 0
+    var jitterBufferEmittedCount: Double = 0
+    var totalDecodeTimeSeconds: Double = 0
+    var totalProcessingDelaySeconds: Double = 0
+    var freezeCount: Double = 0
+    var totalFreezeDurationSeconds: Double = 0
+    var nackCount: Double = 0
+    var pliCount: Double = 0
+    var firCount: Double = 0
+    var retransmittedPackets: Double = 0
+    var codec: String = ""
+    var decoderImplementation: String = ""
+    var powerEfficientDecoder: Bool?
+}
+
+private struct ConnectionStatsSnapshot {
+    var rttMs: Double
+    var selectedNetworkPath: String
+}
+
+private let streamStatsParsingQueue = DispatchQueue(
+    label: "com.cloudnow.stream-stats",
+    qos: .utility
+)
 
 // MARK: - GFNStreamController
 
@@ -61,6 +126,9 @@ final class GFNStreamController: NSObject {
     private(set) var state: StreamState = .idle
     private(set) var stats = StreamStats()
     private(set) var videoTrack: LKRTCVideoTrack?
+    private(set) var statsMode: StreamStatsMode = .hud
+    private(set) var videoDiagnostics = VideoPipelineSnapshot()
+    private(set) var rtcEventLogURL: URL?
     private(set) var pingHistory: [Double] = []
     private(set) var fpsHistory: [Double] = []
     private(set) var bitrateHistory: [Double] = []
@@ -97,6 +165,7 @@ final class GFNStreamController: NSObject {
     private(set) var videoView: VideoSurfaceView?
     private(set) var remoteMode: RemoteInputMode = .mouse
     private var statsTimer: Timer?
+    private var videoReceiver: LKRTCRtpReceiver?
     private var protocolVersion = 2
     private var partialReliableThresholdMs = 300
     private var sessionInfo: SessionInfo?
@@ -107,8 +176,18 @@ final class GFNStreamController: NSObject {
     private var partiallyReliableDataChannel: LKRTCDataChannel?
     private var controlChannel: LKRTCDataChannel?
     private var inputReady = false
-    private var lastBytesReceived: Double = 0
-    private var lastStatsTime: Date = .distantPast
+    private var previousVideoStats: VideoStatsSnapshot?
+    private var statsTick = 0
+    private var statsGeneration = 0
+    private var videoStatsRequestInFlight = false
+    private var connectionStatsRequestInFlight = false
+    private var wasStreaming = false
+    private var reconnectAttempt = 0
+    private static let maxReconnectAttempts = 3
+    /// Set by the caller to enable auto-reconnect on ICE disconnect.
+    var onReconnectNeeded: (() async -> SessionInfo?)?
+    private var previousSelectedCandidatePairId = ""
+    private var lastZoneRttFeedbackAt: Date?
 
     private static let factory: LKRTCPeerConnectionFactory = {
         LKRTCInitializeSSL()
@@ -121,13 +200,20 @@ final class GFNStreamController: NSObject {
 
     func connect(session: SessionInfo, settings: StreamSettings) async {
         // Block if already active; allow from idle, disconnected, or failed (retry case)
-        switch state {
-        case .connecting, .streaming: return
+        let currentState = state
+        switch currentState {
+        case .connecting, .streaming:
+            gfnLog.info("connect: already \(String(describing: currentState)), ignoring")
+            return
         default: break
         }
+        let settings = settings.normalizedForClient
+        gfnLog.info("connect: starting, serverIp=\(session.serverIp), signalingUrl=\(session.signalingUrl)")
         state = .connecting
         sessionInfo = session
         self.settings = settings
+        setStatsMode(settings.statsMode)
+        stats = StreamStats()
         stats.gpuType = session.gpuType ?? ""
         inputSendQueue.sync {
             inputGenerated = 0
@@ -144,8 +230,11 @@ final class GFNStreamController: NSObject {
 
         setupSignaling(session: session)
         do {
+            gfnLog.info("connect: opening signaling WebSocket")
             try await signaling?.connect()
+            gfnLog.info("connect: signaling connected")
         } catch {
+            gfnLog.error("connect: signaling FAILED: \(error)")
             state = .failed(message: error.localizedDescription)
         }
     }
@@ -156,8 +245,56 @@ final class GFNStreamController: NSObject {
     /// Stores a reference so the inputHandler can be wired up when InputSender starts.
     func bindVideoView(_ view: VideoSurfaceView) {
         videoView = view
+        view.setDiagnosticsEnabled(statsMode == .diagnostic)
         view.inputHandler = inputSender
         view.menuPressHandler = { [weak self] in self?.handleMenuPress() }
+    }
+
+    func setStatsMode(_ mode: StreamStatsMode) {
+        guard statsMode != mode else { return }
+        statsMode = mode
+        videoView?.setDiagnosticsEnabled(mode == .diagnostic)
+        if mode == .off {
+            stopStatsTimer()
+        } else if state == .streaming {
+            startStatsTimer()
+        }
+    }
+
+    @discardableResult
+    func startRtcEventLog(maxSizeBytes: Int64 = 15 * 1024 * 1024) -> URL? {
+        guard let peerConnection else { return nil }
+        stopRtcEventLog()
+
+        let fileManager = FileManager.default
+        guard let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let directory = caches.appendingPathComponent("RTCEventLogs", isDirectory: true)
+        do {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            try pruneRtcEventLogs(in: directory, keeping: 2)
+        } catch {
+            print("[Stats] Unable to prepare RTC event log directory: \(error)")
+            return nil
+        }
+
+        let formatter = ISO8601DateFormatter()
+        let filename = "rtc-\(formatter.string(from: Date()).replacingOccurrences(of: ":", with: "-"))-\(UUID().uuidString).log"
+        let url = directory.appendingPathComponent(filename)
+        guard peerConnection.startRtcEventLog(
+            withFilePath: url.path,
+            maxSizeInBytes: max(1_048_576, maxSizeBytes)
+        ) else { return nil }
+
+        rtcEventLogURL = url
+        return url
+    }
+
+    func stopRtcEventLog() {
+        guard rtcEventLogURL != nil else { return }
+        peerConnection?.stopRtcEventLog()
+        rtcEventLogURL = nil
     }
 
     /// Invoked by VideoSurfaceView when the user presses Menu.
@@ -186,9 +323,13 @@ final class GFNStreamController: NSObject {
     // MARK: Disconnect
 
     func disconnect() {
-        statsTimer?.invalidate()
+        stopRtcEventLog()
+        stopStatsTimer()
+        wasStreaming = false
+        reconnectAttempt = 0
         inputSender?.stop()
         signaling?.disconnect()
+        videoView?.videoTrack = nil
         peerConnection?.close()
         peerConnection = nil
         inputDataChannel = nil
@@ -202,6 +343,7 @@ final class GFNStreamController: NSObject {
         partiallyReliableDataChannel = nil
         controlChannel = nil
         videoTrack = nil
+        videoReceiver = nil
         micAudioTrack = nil
         micAudioSource = nil
         pingHistory = []
@@ -209,15 +351,80 @@ final class GFNStreamController: NSObject {
         bitrateHistory = []
         signalingComplete = false
         inputReady = false
-        lastBytesReceived = 0
-        lastStatsTime = .distantPast
+        previousVideoStats = nil
+        statsTick = 0
+        previousSelectedCandidatePairId = ""
+        lastZoneRttFeedbackAt = nil
         videoView?.inputHandler = nil
         videoView?.menuPressHandler = nil
         videoView = nil
         remoteMode = .mouse
         menuPressCount = 0
         timeWarning = nil
+        videoDiagnostics = VideoPipelineSnapshot()
         state = .idle
+    }
+
+    // MARK: Auto-Reconnect
+
+    private func attemptReconnect() {
+        reconnectAttempt += 1
+        let attempt = reconnectAttempt
+        gfnLog.info("attemptReconnect: attempt \(attempt)/\(Self.maxReconnectAttempts)")
+
+        guard attempt <= Self.maxReconnectAttempts, onReconnectNeeded != nil else {
+            gfnLog.info("attemptReconnect: giving up, showing sessionEnded")
+            state = .sessionEnded
+            return
+        }
+
+        state = .reconnecting(attempt: attempt)
+
+        // Tear down current peer connection before reconnecting
+        inputSender?.stop()
+        signaling?.disconnect()
+        peerConnection?.close()
+        peerConnection = nil
+        inputDataChannel = nil
+        partiallyReliableDataChannel = nil
+        reliableSendChannel = nil
+        controlChannel = nil
+        videoTrack = nil
+        micAudioTrack = nil
+        micAudioSource = nil
+        signalingComplete = false
+        inputReady = false
+
+        let delays: [TimeInterval] = [0.5, 1.0, 2.0]
+        let delay = delays[min(attempt - 1, delays.count - 1)]
+
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self else { return }
+            guard case .reconnecting = state else { return }
+
+            guard let reclaim = onReconnectNeeded,
+                  let session = await reclaim()
+            else {
+                gfnLog.info("attemptReconnect: reclaim failed on attempt \(attempt)")
+                if attempt >= Self.maxReconnectAttempts {
+                    state = .sessionEnded
+                }
+                return
+            }
+
+            gfnLog.info("attemptReconnect: reclaimed session, reconnecting WebRTC")
+            sessionInfo = session
+            setupSignaling(session: session)
+            do {
+                try await signaling?.connect()
+            } catch {
+                gfnLog.error("attemptReconnect: signaling failed: \(error)")
+                if attempt >= Self.maxReconnectAttempts {
+                    state = .sessionEnded
+                }
+            }
+        }
     }
 
     // MARK: Private — Signaling Setup
@@ -264,8 +471,10 @@ final class GFNStreamController: NSObject {
 
     private func handleOffer(sdp: String) async {
         guard let session = sessionInfo else { return }
-        print("[Stream] Offer SDP (\(sdp.count) chars):")
-        sdp.components(separatedBy: "\r\n").forEach { print("  \($0)") }
+        #if DEBUG
+            print("[Stream] Offer SDP (\(sdp.count) chars):")
+            sdp.components(separatedBy: "\r\n").forEach { print("  \($0)") }
+        #endif
 
         // Configure audio session for real-time streaming before creating the peer connection.
         // .playback + .moviePlayback gives the lowest latency path; allowBluetooth covers
@@ -274,7 +483,7 @@ final class GFNStreamController: NSObject {
             try AVAudioSession.sharedInstance().setCategory(
                 .playback,
                 mode: .moviePlayback,
-                options: [.allowBluetooth, .allowBluetoothA2DP]
+                options: [.allowBluetoothHFP, .allowBluetoothA2DP]
             )
             try AVAudioSession.sharedInstance().setActive(true)
         } catch {
@@ -305,6 +514,13 @@ final class GFNStreamController: NSObject {
             return
         }
         peerConnection = pc
+        if settings.enableRtcEventLog {
+            if let url = startRtcEventLog() {
+                print("[Stats] RTC event log: \(url.path)")
+            } else {
+                print("[Stats] Unable to start RTC event log")
+            }
+        }
         print("[Stream] Peer connection created, starting offer handling")
 
         // Reliable ordered input channel — label must match the GFN server's expected "input_channel_v1"
@@ -388,8 +604,10 @@ final class GFNStreamController: NSObject {
                 ? SDPMunger.rewriteH265LevelId(SDPMunger.rewriteH265TierFlag(codecFilteredSdp))
                 : codecFilteredSdp
             let mangledAnswerSdp = SDPMunger.injectBandwidth(h265SafeSdp, videoKbps: settings.maxBitrateKbps)
-            print("[Stream] Answer SDP (\(mangledAnswerSdp.count) chars):")
-            mangledAnswerSdp.components(separatedBy: "\r\n").forEach { print("  \($0)") }
+            #if DEBUG
+                print("[Stream] Answer SDP (\(mangledAnswerSdp.count) chars):")
+                mangledAnswerSdp.components(separatedBy: "\r\n").forEach { print("  \($0)") }
+            #endif
 
             // Set local description
             let localSDP = LKRTCSessionDescription(type: .answer, sdp: mangledAnswerSdp)
@@ -581,21 +799,77 @@ final class GFNStreamController: NSObject {
             sdpMLineIndex: Int32(sdpMLineIndex ?? 0),
             sdpMid: sdpMid
         )
-        peerConnection?.add(ice)
+        peerConnection?.add(ice, completionHandler: { _ in })
     }
 
     // MARK: Private — Stats
 
     private func startStatsTimer() {
-        statsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.collectStats()
+        guard statsMode != .off, statsTimer == nil else { return }
+        collectStats()
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.collectStats() }
         }
+        statsTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopStatsTimer() {
+        statsTimer?.invalidate()
+        statsTimer = nil
+        statsGeneration &+= 1
+        videoStatsRequestInFlight = false
+        connectionStatsRequestInFlight = false
+        previousVideoStats = nil
+        statsTick = 0
     }
 
     private func collectStats() {
+        guard statsMode != .off, let peerConnection else { return }
         collectInputStats()
-        peerConnection?.statistics { [weak self] report in
-            Task { @MainActor [weak self] in self?.parseStats(report) }
+        if statsMode == .diagnostic {
+            let generation = statsGeneration
+            videoView?.captureDiagnostics { [weak self] snapshot in
+                Task { @MainActor [weak self] in
+                    guard let self, statsGeneration == generation, statsMode == .diagnostic else {
+                        return
+                    }
+                    videoDiagnostics = snapshot
+                }
+            }
+        }
+        statsTick &+= 1
+        let generation = statsGeneration
+
+        if let videoReceiver, !videoStatsRequestInFlight {
+            videoStatsRequestInFlight = true
+            peerConnection.statistics(for: videoReceiver) { [weak self] report in
+                streamStatsParsingQueue.async {
+                    let snapshot = Self.parseVideoStats(report)
+                    Task { @MainActor [weak self] in
+                        guard let self, statsGeneration == generation else { return }
+                        videoStatsRequestInFlight = false
+                        if let snapshot { applyVideoStats(snapshot) }
+                    }
+                }
+            }
+        }
+
+        if statsTick == 1 || statsTick.isMultiple(of: 5), !connectionStatsRequestInFlight {
+            connectionStatsRequestInFlight = true
+            peerConnection.statistics { [weak self] report in
+                streamStatsParsingQueue.async {
+                    let snapshot = Self.parseConnectionStats(report)
+                    Task { @MainActor [weak self] in
+                        guard let self, statsGeneration == generation else { return }
+                        connectionStatsRequestInFlight = false
+                        if let snapshot {
+                            stats.rttMs = snapshot.rttMs
+                            stats.selectedNetworkPath = snapshot.selectedNetworkPath
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -638,7 +912,7 @@ final class GFNStreamController: NSObject {
         }
     }
 
-    private func parseStats(_ report: LKRTCStatisticsReport) {
+    private nonisolated static func parseVideoStats(_ report: LKRTCStatisticsReport) -> VideoStatsSnapshot? {
         // Build codec name lookup: stat ID → human-readable name (e.g. "H.265", "AV1")
         var codecNames: [String: String] = [:]
         for (id, stat) in report.statistics where stat.type == "codec" {
@@ -653,6 +927,41 @@ final class GFNStreamController: NSObject {
             }
         }
 
+        guard let stat = report.statistics.values.first(where: {
+            $0.type == "inbound-rtp" && $0.values["kind"] as? String == "video"
+        }) else { return nil }
+
+        let codecId = stat.values["codecId"] as? String ?? ""
+        return VideoStatsSnapshot(
+            timestampUs: stat.timestamp_us,
+            bytesReceived: numericValue(stat.values["bytesReceived"]),
+            packetsReceived: numericValue(stat.values["packetsReceived"]),
+            packetsLost: numericValue(stat.values["packetsLost"]),
+            framesDecoded: numericValue(stat.values["framesDecoded"]),
+            framesDropped: numericValue(stat.values["framesDropped"]),
+            framesPerSecond: numericValue(stat.values["framesPerSecond"]),
+            frameWidth: numericValue(stat.values["frameWidth"]),
+            frameHeight: numericValue(stat.values["frameHeight"]),
+            jitterSeconds: numericValue(stat.values["jitter"]),
+            jitterBufferDelaySeconds: numericValue(stat.values["jitterBufferDelay"]),
+            jitterBufferTargetDelaySeconds: numericValue(stat.values["jitterBufferTargetDelay"]),
+            jitterBufferMinimumDelaySeconds: numericValue(stat.values["jitterBufferMinimumDelay"]),
+            jitterBufferEmittedCount: numericValue(stat.values["jitterBufferEmittedCount"]),
+            totalDecodeTimeSeconds: numericValue(stat.values["totalDecodeTime"]),
+            totalProcessingDelaySeconds: numericValue(stat.values["totalProcessingDelay"]),
+            freezeCount: numericValue(stat.values["freezeCount"]),
+            totalFreezeDurationSeconds: numericValue(stat.values["totalFreezesDuration"]),
+            nackCount: numericValue(stat.values["nackCount"]),
+            pliCount: numericValue(stat.values["pliCount"]),
+            firCount: numericValue(stat.values["firCount"]),
+            retransmittedPackets: numericValue(stat.values["retransmittedPacketsReceived"]),
+            codec: codecNames[codecId] ?? codecId,
+            decoderImplementation: stat.values["decoderImplementation"] as? String ?? "",
+            powerEfficientDecoder: boolValue(stat.values["powerEfficientDecoder"])
+        )
+    }
+
+    private nonisolated static func parseConnectionStats(_ report: LKRTCStatisticsReport) -> ConnectionStatsSnapshot? {
         var candidateDetails: [String: (protocolName: String, candidateType: String)] = [:]
         var candidatePairs: [String: (localID: String, remoteID: String, rttMs: Double, nominated: Bool)] = [:]
         var selectedCandidatePairID: String?
@@ -672,72 +981,222 @@ final class GFNStreamController: NSObject {
                 candidatePairs[id] = (
                     localID: stat.values["localCandidateId"] as? String ?? "",
                     remoteID: stat.values["remoteCandidateId"] as? String ?? "",
-                    rttMs: (stat.values["currentRoundTripTime"] as? Double ?? 0) * 1000,
-                    nominated: stat.values["nominated"] as? Bool ?? false
+                    rttMs: numericValue(stat.values["currentRoundTripTime"]) * 1000,
+                    nominated: boolValue(stat.values["nominated"]) ?? false
                 )
-            }
-
-            if stat.type == "inbound-rtp", stat.values["kind"] as? String == "video" {
-                let bytesReceived = stat.values["bytesReceived"] as? Double ?? 0
-                let framesReceived = stat.values["framesReceived"] as? Double ?? 0
-                let framesDecoded = stat.values["framesDecoded"] as? Double ?? 0
-                let now = Date()
-                let elapsed = now.timeIntervalSince(lastStatsTime)
-                if elapsed > 0, lastBytesReceived > 0 {
-                    let deltaBytes = bytesReceived - lastBytesReceived
-                    stats.bitrateKbps = Int(max(0, deltaBytes) * 8 / elapsed / 1000)
-                }
-                lastBytesReceived = bytesReceived
-                lastStatsTime = now
-
-                stats.fps = stat.values["framesPerSecond"] as? Double ?? 0
-                if let w = stat.values["frameWidth"] as? Double,
-                   let h = stat.values["frameHeight"] as? Double
-                {
-                    stats.resolutionWidth = Int(w)
-                    stats.resolutionHeight = Int(h)
-                }
-                // Resolve the codec name from the codecId reference (e.g. "RTCCodec_V_Inbound_127" → "H.265")
-                let codecId = stat.values["codecId"] as? String ?? ""
-                stats.codec = codecNames[codecId] ?? codecId
-                stats.jitterMs = (stat.values["jitter"] as? Double ?? 0) * 1000
-                let lost = stat.values["packetsLost"] as? Double ?? 0
-                let received = stat.values["packetsReceived"] as? Double ?? 0
-                if lost + received > 0 {
-                    stats.packetLossPercent = lost / (lost + received) * 100
-                }
-                print("[Stats] framesReceived=\(Int(framesReceived)) framesDecoded=\(Int(framesDecoded)) fps=\(stats.fps) res=\(stats.resolutionWidth)×\(stats.resolutionHeight) bitrateKbps=\(stats.bitrateKbps) codec=\(stats.codec)")
             }
         }
 
         let selectedPair = selectedCandidatePairID.flatMap { candidatePairs[$0] }
             ?? candidatePairs.values.first(where: \.nominated)
-        if let selectedPair {
-            stats.rttMs = selectedPair.rttMs
-            let local = candidateDetails[selectedPair.localID]
-            let remote = candidateDetails[selectedPair.remoteID]
-            let protocolName = local?.protocolName.isEmpty == false
-                ? local?.protocolName ?? ""
-                : remote?.protocolName ?? ""
-            let usesRelay = local?.candidateType == "relay" || remote?.candidateType == "relay"
-            if protocolName == "tcp" || protocolName == "tls" {
-                stats.selectedNetworkPath = "TCP/TLS fallback"
-            } else if usesRelay, protocolName == "udp" {
-                stats.selectedNetworkPath = "TURN/UDP relay"
-            } else if protocolName == "udp" {
-                stats.selectedNetworkPath = "Direct UDP"
-            } else {
-                stats.selectedNetworkPath = "Unknown"
-            }
+            ?? candidatePairs.values.first
+        guard let selectedPair else { return nil }
+
+        let local = candidateDetails[selectedPair.localID]
+        let remote = candidateDetails[selectedPair.remoteID]
+        let protocolName = local?.protocolName.isEmpty == false
+            ? local?.protocolName ?? ""
+            : remote?.protocolName ?? ""
+        let usesRelay = local?.candidateType == "relay" || remote?.candidateType == "relay"
+        let selectedNetworkPath = if protocolName == "tcp" || protocolName == "tls" {
+            "TCP/TLS fallback"
+        } else if usesRelay, protocolName == "udp" {
+            "TURN/UDP relay"
+        } else if protocolName == "udp" {
+            "Direct UDP"
+        } else {
+            "Unknown"
         }
+        return ConnectionStatsSnapshot(
+            rttMs: selectedPair.rttMs,
+            selectedNetworkPath: selectedNetworkPath
+        )
+    }
+
+    private nonisolated static func numericValue(_ value: Any?) -> Double {
+        (value as? NSNumber)?.doubleValue ?? 0
+    }
+
+    private nonisolated static func boolValue(_ value: Any?) -> Bool? {
+        (value as? NSNumber)?.boolValue
+    }
+
+    private func applyVideoStats(_ sample: VideoStatsSnapshot) {
+        stats.fps = sample.framesPerSecond
+        stats.resolutionWidth = Int(sample.frameWidth)
+        stats.resolutionHeight = Int(sample.frameHeight)
+        stats.codec = sample.codec
+        stats.jitterMs = sample.jitterSeconds * 1000
+        stats.decoderImplementation = sample.decoderImplementation
+        stats.powerEfficientDecoder = sample.powerEfficientDecoder
+
+        if let previous = previousVideoStats {
+            let elapsedSeconds = (sample.timestampUs - previous.timestampUs) / 1_000_000
+            if elapsedSeconds > 0 {
+                stats.bitrateKbps = Int(
+                    max(0, sample.bytesReceived - previous.bytesReceived) * 8 / elapsedSeconds / 1000
+                )
+            }
+
+            let received = max(0, sample.packetsReceived - previous.packetsReceived)
+            let lost = max(0, sample.packetsLost - previous.packetsLost)
+            if received + lost > 0 {
+                stats.packetLossPercent = lost / (received + lost) * 100
+            }
+
+            let emitted = max(0, sample.jitterBufferEmittedCount - previous.jitterBufferEmittedCount)
+            stats.jitterBufferDelayMs = intervalAverage(
+                sample.jitterBufferDelaySeconds,
+                previous.jitterBufferDelaySeconds,
+                count: emitted
+            )
+            stats.jitterBufferTargetDelayMs = intervalAverage(
+                sample.jitterBufferTargetDelaySeconds,
+                previous.jitterBufferTargetDelaySeconds,
+                count: emitted
+            )
+            stats.jitterBufferMinimumDelayMs = intervalAverage(
+                sample.jitterBufferMinimumDelaySeconds,
+                previous.jitterBufferMinimumDelaySeconds,
+                count: emitted
+            )
+
+            let decoded = max(0, sample.framesDecoded - previous.framesDecoded)
+            stats.decodeTimeMs = intervalAverage(
+                sample.totalDecodeTimeSeconds,
+                previous.totalDecodeTimeSeconds,
+                count: decoded
+            )
+            stats.processingDelayMs = intervalAverage(
+                sample.totalProcessingDelaySeconds,
+                previous.totalProcessingDelaySeconds,
+                count: decoded
+            )
+            stats.framesDropped = intervalCount(sample.framesDropped, previous.framesDropped)
+            stats.freezeCount = intervalCount(sample.freezeCount, previous.freezeCount)
+            stats.freezeDurationMs = max(
+                0,
+                sample.totalFreezeDurationSeconds - previous.totalFreezeDurationSeconds
+            ) * 1000
+            stats.nackCount = intervalCount(sample.nackCount, previous.nackCount)
+            stats.pliCount = intervalCount(sample.pliCount, previous.pliCount)
+            stats.firCount = intervalCount(sample.firCount, previous.firCount)
+            stats.retransmittedPackets = intervalCount(
+                sample.retransmittedPackets,
+                previous.retransmittedPackets
+            )
+        }
+
+        previousVideoStats = sample
         appendHistory(&pingHistory, value: stats.rttMs)
         appendHistory(&fpsHistory, value: stats.fps)
         appendHistory(&bitrateHistory, value: Double(stats.bitrateKbps) / 1000.0)
     }
 
+    private func intervalAverage(_ current: Double, _ previous: Double, count: Double) -> Double {
+        guard count > 0 else { return 0 }
+        return max(0, current - previous) / count * 1000
+    }
+
+    private func intervalCount(_ current: Double, _ previous: Double) -> Int {
+        Int(max(0, current - previous))
+    }
+
+    private func pruneRtcEventLogs(in directory: URL, keeping count: Int) throws {
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey, .creationDateKey]
+        let logs = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]
+        )
+        let sorted = logs.sorted { lhs, rhs in
+            let leftValues = try? lhs.resourceValues(forKeys: keys)
+            let rightValues = try? rhs.resourceValues(forKeys: keys)
+            let leftDate = leftValues?.contentModificationDate ?? leftValues?.creationDate ?? .distantPast
+            let rightDate = rightValues?.contentModificationDate ?? rightValues?.creationDate ?? .distantPast
+            return leftDate > rightDate
+        }
+        for url in sorted.dropFirst(max(0, count)) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
     private func appendHistory(_ history: inout [Double], value: Double) {
         if history.count >= 30 { history.removeFirst() }
         history.append(value)
+    }
+
+    private func parseSelectedConnectionStats(_ report: LKRTCStatisticsReport) {
+        let transport = report.statistics.values.first { $0.type == "transport" }
+        let selectedPairId = transport?.values["selectedCandidatePairId"] as? String
+        let succeededPairs = report.statistics.values.filter {
+            $0.type == "candidate-pair" && $0.values["state"] as? String == "succeeded"
+        }
+        let selectedPair = selectedPairId.flatMap { report.statistics[$0] }
+            ?? succeededPairs.first(where: { ($0.values["nominated"] as? NSNumber)?.boolValue == true })
+            ?? succeededPairs.first
+        guard let selectedPair else { return }
+
+        let localId = selectedPair.values["localCandidateId"] as? String
+        let remoteId = selectedPair.values["remoteCandidateId"] as? String
+        let local = localId.flatMap { report.statistics[$0] }
+        let remote = remoteId.flatMap { report.statistics[$0] }
+        let pairId = selectedPair.id
+
+        if !previousSelectedCandidatePairId.isEmpty, previousSelectedCandidatePairId != pairId {
+            stats.candidatePairChanges += 1
+            print("[ICE] Selected pair changed: \(previousSelectedCandidatePairId) -> \(pairId)")
+        }
+        previousSelectedCandidatePairId = pairId
+
+        stats.selectedCandidatePairId = pairId
+        stats.rttMs = numericValue(selectedPair.values["currentRoundTripTime"]) * 1000
+        stats.availableIncomingBitrateKbps = Int(
+            numericValue(selectedPair.values["availableIncomingBitrate"]) / 1000
+        )
+        let localProtocol = local?.values["protocol"] as? String ?? ""
+        let remoteProtocol = remote?.values["protocol"] as? String ?? ""
+        stats.selectedProtocol = localProtocol.isEmpty ? remoteProtocol : localProtocol
+        stats.localCandidateType = local?.values["candidateType"] as? String ?? ""
+        stats.remoteCandidateType = remote?.values["candidateType"] as? String ?? ""
+        stats.localCandidateAddress = candidateAddress(local)
+        stats.remoteCandidateAddress = candidateAddress(remote)
+        let protocolName = stats.selectedProtocol.lowercased()
+        let usesRelay = stats.localCandidateType.lowercased() == "relay"
+            || stats.remoteCandidateType.lowercased() == "relay"
+        if protocolName == "tcp" || protocolName == "tls" {
+            stats.selectedNetworkPath = "TCP/TLS fallback"
+        } else if usesRelay, protocolName == "udp" {
+            stats.selectedNetworkPath = "TURN/UDP relay"
+        } else if protocolName == "udp" {
+            stats.selectedNetworkPath = "Direct UDP"
+        } else {
+            stats.selectedNetworkPath = "Unknown"
+        }
+
+        let now = Date()
+        if stats.rttMs > 0,
+           lastZoneRttFeedbackAt.map({ now.timeIntervalSince($0) >= 30 }) ?? true,
+           let zoneUrl = sessionInfo?.zone,
+           !zoneUrl.isEmpty
+        {
+            lastZoneRttFeedbackAt = now
+            let rttMs = stats.rttMs
+            Task { await ZoneClient.shared.recordSessionRtt(zoneUrl: zoneUrl, rttMs: rttMs) }
+        }
+    }
+
+    private func candidateAddress(_ candidate: LKRTCStatistics?) -> String {
+        guard let candidate else { return "" }
+        let address = candidate.values["address"] as? String
+            ?? candidate.values["ip"] as? String
+            ?? ""
+        let port = Int(numericValue(candidate.values["port"]))
+        return port > 0 ? "\(address):\(port)" : address
+    }
+
+    private func numericValue(_ value: Any?) -> Double {
+        (value as? NSNumber)?.doubleValue ?? 0
     }
 }
 
@@ -763,22 +1222,32 @@ extension GFNStreamController: LKRTCPeerConnectionDelegate {
         case .failed: "failed"
         case .disconnected: "disconnected"
         case .closed: "closed"
+        case .count: "count"
         @unknown default: "unknown(\(newState.rawValue))"
         }
         print("[ICE] State → \(name)")
         Task { @MainActor [weak self] in
+            guard let self else { return }
             switch newState {
             case .connected, .completed:
-                self?.state = .streaming
-                self?.startStatsTimer()
+                wasStreaming = true
+                reconnectAttempt = 0
+                state = .streaming
+                startStatsTimer()
             case .disconnected:
-                self?.statsTimer?.invalidate()
-                self?.statsTimer = nil
-                self?.state = .disconnected(reason: "ICE disconnected")
+                stopStatsTimer()
+                if wasStreaming {
+                    attemptReconnect()
+                } else {
+                    state = .disconnected(reason: "ICE disconnected")
+                }
             case .failed:
-                self?.statsTimer?.invalidate()
-                self?.statsTimer = nil
-                self?.state = .failed(message: "ICE connection failed")
+                stopStatsTimer()
+                if wasStreaming {
+                    attemptReconnect()
+                } else {
+                    state = .failed(message: "ICE connection failed")
+                }
             default:
                 break
             }
@@ -825,6 +1294,7 @@ extension GFNStreamController: LKRTCPeerConnectionDelegate {
         guard let track = rtpReceiver.track as? LKRTCVideoTrack else { return }
         print("[Stream] Got video track")
         Task { @MainActor [weak self] in
+            self?.videoReceiver = rtpReceiver
             self?.videoTrack = track
         }
     }

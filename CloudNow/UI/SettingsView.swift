@@ -43,15 +43,25 @@ struct SettingsView: View {
                             Text(codec.rawValue).tag(codec)
                         }
                     }
+                    .onChange(of: vm.streamSettings.codec) { _, codec in
+                        if codec == .av1 {
+                            vm.streamSettings.colorQuality = .sdr8bit
+                        }
+                    }
 
                     Picker(selection: $vm.streamSettings.colorQuality) {
                         ForEach(ColorQuality.allCases, id: \.self) { q in
                             Text(colorQualityLabel(q)).tag(q)
+                                .disabled(vm.streamSettings.codec == .av1 && q != .sdr8bit)
                         }
                     } label: {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Color Quality")
-                            if vm.streamSettings.colorQuality == .hdr10bit {
+                            if vm.streamSettings.codec == .av1 {
+                                Text("AV1 uses the software I420 path and is limited to SDR 8-bit BT.709.")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                            } else if vm.streamSettings.colorQuality == .hdr10bit {
                                 Text("⚠️ Experimental — GFN may downscale to ~540p when HDR is enabled.")
                                     .font(.caption)
                                     .foregroundStyle(.orange)
@@ -232,6 +242,38 @@ struct SettingsView: View {
                     LabeledContent("Protocol", value: "XInput over GFN v2/v3")
                 }
 
+                Section("Diagnostics") {
+                    Picker(selection: $vm.streamSettings.statsMode) {
+                        ForEach(StreamStatsMode.allCases, id: \.self) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    } label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Statistics Mode")
+                            Text(statsModeDescription(vm.streamSettings.statsMode))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 8)
+                    }
+                    .onChange(of: vm.streamSettings.statsMode) { _, mode in
+                        if mode != .diagnostic {
+                            vm.streamSettings.enableRtcEventLog = false
+                        }
+                    }
+
+                    Toggle(isOn: $vm.streamSettings.enableRtcEventLog) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("RTC Event Log")
+                            Text("Writes a bounded WebRTC event log to the app caches directory for the next stream.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 8)
+                    }
+                    .disabled(vm.streamSettings.statsMode != .diagnostic)
+                }
+
                 Section("Account") {
                     if let user = authManager.session?.user {
                         LabeledContent("Name", value: user.displayName)
@@ -286,6 +328,14 @@ struct SettingsView: View {
         case .hdr10bit: "HDR 10-bit"
         }
     }
+
+    private func statsModeDescription(_ mode: StreamStatsMode) -> String {
+        switch mode {
+        case .off: "Disables periodic WebRTC statistics collection."
+        case .hud: "Collects the lightweight statistics shown in the in-stream overlay."
+        case .diagnostic: "Adds receiver timing, renderer metrics, frame counters, and Instruments signposts."
+        }
+    }
 }
 
 // MARK: - Zone Picker
@@ -306,7 +356,10 @@ private struct ZonePickerView: View {
             + grouped.keys.filter { !order.contains($0) }.sorted()
         return sortedRegions.map { region in
             let meta = GFNZone.regionMeta[region] ?? (label: region, flag: "🌐")
-            return (region, meta.label, meta.flag, grouped[region, default: []])
+            let sorted = grouped[region, default: []].sorted {
+                ($0.pingMs ?? .max) < ($1.pingMs ?? .max)
+            }
+            return (region, meta.label, meta.flag, sorted)
         }
     }
 
@@ -328,8 +381,7 @@ private struct ZonePickerView: View {
                         // Auto option
                         Section {
                             Button {
-                                selectedZoneUrl = nil
-                                dismiss()
+                                select(nil)
                             } label: {
                                 HStack {
                                     VStack(alignment: .leading) {
@@ -355,8 +407,7 @@ private struct ZonePickerView: View {
                             Section("\(group.flag) \(group.label)") {
                                 ForEach(group.zones) { zone in
                                     Button {
-                                        selectedZoneUrl = zone.zoneUrl
-                                        dismiss()
+                                        select(zone.zoneUrl)
                                     } label: {
                                         HStack {
                                             VStack(alignment: .leading, spacing: 2) {
@@ -402,15 +453,22 @@ private struct ZonePickerView: View {
         }
     }
 
+    private func select(_ url: String?) {
+        selectedZoneUrl = url
+        Task { @MainActor in
+            dismiss()
+        }
+    }
+
     private func loadZones() async {
         isLoading = true
         error = nil
         do {
             zones = try await ZoneClient.shared.fetchZones()
             isLoading = false
-            // Measure pings concurrently in batches of 6
             let batchSize = 6
             for start in stride(from: 0, to: zones.count, by: batchSize) {
+                if Task.isCancelled { return }
                 let end = min(start + batchSize, zones.count)
                 let batch = zones[start ..< end]
                 await withTaskGroup(of: (String, Int?).self) { group in
@@ -421,6 +479,7 @@ private struct ZonePickerView: View {
                         }
                     }
                     for await (id, ping) in group {
+                        if Task.isCancelled { return }
                         if let idx = zones.firstIndex(where: { $0.id == id }) {
                             zones[idx].pingMs = ping
                             zones[idx].isMeasuring = false
@@ -428,6 +487,7 @@ private struct ZonePickerView: View {
                     }
                 }
             }
+            await ZoneClient.shared.cacheAutomaticSelections(from: zones)
         } catch {
             isLoading = false
             self.error = error.localizedDescription

@@ -1,5 +1,8 @@
 import Charts
+import os.log
 import SwiftUI
+
+private let streamLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "Stream")
 
 private enum LoadingPhase: Equatable {
     case finding
@@ -40,14 +43,23 @@ struct StreamView: View {
                 connectingView
             case .streaming:
                 streamingView
+            case let .reconnecting(attempt):
+                reconnectingView(attempt: attempt)
             case let .disconnected(reason):
                 disconnectedView(reason)
             case let .failed(message):
                 failedView(message)
+            case .sessionEnded:
+                sessionEndedView
             }
         }
         .ignoresSafeArea()
-        .task { await startSession() }
+        .task {
+            streamController.onReconnectNeeded = { [self] in
+                await reclaimSession()
+            }
+            await startSession()
+        }
         .onDisappear { streamController.disconnect() }
         // During streaming, VideoSurfaceView is first responder and intercepts Menu via UIKit,
         // signaling us through menuPressCount. .onExitCommand only fires in non-streaming states
@@ -204,61 +216,70 @@ struct StreamView: View {
 
             // Live stats
             VStack(alignment: .leading, spacing: 10) {
-                metricRow(
-                    icon: "network",
-                    label: "RTT",
-                    value: "\(Int(streamController.stats.rttMs)) ms",
-                    history: streamController.pingHistory,
-                    color: pingColor(streamController.stats.rttMs)
-                )
-                metricRow(
-                    icon: "speedometer",
-                    label: "FPS",
-                    value: "\(Int(streamController.stats.fps))",
-                    history: streamController.fpsHistory,
-                    color: fpsColor(streamController.stats.fps)
-                )
-                metricRow(
-                    icon: "wifi",
-                    label: "Bitrate",
-                    value: "\(streamController.stats.bitrateKbps / 1000) Mbps",
-                    history: streamController.bitrateHistory,
-                    color: .cyan
-                )
-                Divider().overlay(.white.opacity(0.4))
-                Label("\(streamController.stats.resolutionWidth)×\(streamController.stats.resolutionHeight) @ \(Int(streamController.stats.fps))fps", systemImage: "tv")
-                Label("Loss \(String(format: "%.1f", streamController.stats.packetLossPercent))%", systemImage: "arrow.triangle.2.circlepath")
-                Label(streamController.stats.selectedNetworkPath, systemImage: "point.3.connected.trianglepath.dotted")
-                Label(
-                    "Input p95 \(String(format: "%.1f", streamController.stats.inputQueueP95Ms)) ms · \(streamController.stats.inputBufferedBytes) B queued",
-                    systemImage: "gamecontroller"
-                )
-                if streamController.stats.inputDropped > 0 {
-                    Label(
-                        "Input drops \(streamController.stats.inputDropped)",
-                        systemImage: "exclamationmark.triangle"
+                if streamController.statsMode == .off {
+                    Label("Statistics disabled", systemImage: "chart.bar.xaxis")
+                        .foregroundStyle(.secondary)
+                } else {
+                    metricRow(
+                        icon: "network",
+                        label: "RTT",
+                        value: "\(Int(streamController.stats.rttMs)) ms",
+                        history: streamController.pingHistory,
+                        color: pingColor(streamController.stats.rttMs)
                     )
-                    .foregroundStyle(.orange)
-                }
-                if streamController.stats.inputSuperseded > 0 {
-                    Label(
-                        "Analog snapshots coalesced \(streamController.stats.inputSuperseded)",
-                        systemImage: "arrow.triangle.merge"
+                    metricRow(
+                        icon: "speedometer",
+                        label: "FPS",
+                        value: "\(Int(streamController.stats.fps))",
+                        history: streamController.fpsHistory,
+                        color: fpsColor(streamController.stats.fps)
                     )
-                    .foregroundStyle(.secondary)
-                }
-                if !streamController.stats.gpuType.isEmpty {
-                    Label(streamController.stats.gpuType, systemImage: "cpu")
-                }
-                if let sub = viewModel.subscription, !sub.isUnlimited, let rem = sub.remainingMinutes {
+                    metricRow(
+                        icon: "wifi",
+                        label: "Bitrate",
+                        value: "\(streamController.stats.bitrateKbps / 1000) Mbps",
+                        history: streamController.bitrateHistory,
+                        color: .cyan
+                    )
                     Divider().overlay(.white.opacity(0.4))
-                    Label {
-                        Text(rem >= 60 ? "\(rem / 60)h \(rem % 60)m remaining" : "\(rem)m remaining")
-                    } icon: {
-                        Image(systemName: "clock")
-                            .foregroundStyle(rem < 30 ? .orange : .white.opacity(0.7))
+                    Label("\(streamController.stats.resolutionWidth)×\(streamController.stats.resolutionHeight) @ \(Int(streamController.stats.fps))fps", systemImage: "tv")
+                    Label("Loss \(String(format: "%.1f", streamController.stats.packetLossPercent))%", systemImage: "arrow.triangle.2.circlepath")
+                    Label(streamController.stats.selectedNetworkPath, systemImage: "point.3.connected.trianglepath.dotted")
+                    Label(
+                        "Input p95 \(String(format: "%.1f", streamController.stats.inputQueueP95Ms)) ms · \(streamController.stats.inputBufferedBytes) B queued",
+                        systemImage: "gamecontroller"
+                    )
+                    if streamController.stats.inputDropped > 0 {
+                        Label(
+                            "Input drops \(streamController.stats.inputDropped)",
+                            systemImage: "exclamationmark.triangle"
+                        )
+                        .foregroundStyle(.orange)
                     }
-                    .foregroundStyle(rem < 30 ? .orange : .white)
+                    if streamController.stats.inputSuperseded > 0 {
+                        Label(
+                            "Analog snapshots coalesced \(streamController.stats.inputSuperseded)",
+                            systemImage: "arrow.triangle.merge"
+                        )
+                        .foregroundStyle(.secondary)
+                    }
+                    if !streamController.stats.gpuType.isEmpty {
+                        Label(streamController.stats.gpuType, systemImage: "cpu")
+                    }
+                    if let sub = viewModel.subscription, !sub.isUnlimited, let rem = sub.remainingMinutes {
+                        Divider().overlay(.white.opacity(0.4))
+                        Label {
+                            Text(rem >= 60 ? "\(rem / 60)h \(rem % 60)m remaining" : "\(rem)m remaining")
+                        } icon: {
+                            Image(systemName: "clock")
+                                .foregroundStyle(rem < 30 ? .orange : .white.opacity(0.7))
+                        }
+                        .foregroundStyle(rem < 30 ? .orange : .white)
+                    }
+                }
+
+                if streamController.statsMode == .diagnostic {
+                    diagnosticRows
                 }
             }
             .font(.caption.weight(.medium))
@@ -268,6 +289,48 @@ struct StreamView: View {
         .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 16))
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         .padding(60)
+    }
+
+    private var diagnosticRows: some View {
+        let pipeline = streamController.videoDiagnostics
+        return Group {
+            Divider().overlay(.white.opacity(0.4))
+            Label(
+                "Jitter buffer \(formatMs(streamController.stats.jitterBufferDelayMs)) / target \(formatMs(streamController.stats.jitterBufferTargetDelayMs))",
+                systemImage: "waveform.path"
+            )
+            Label(
+                "Decode \(formatMs(streamController.stats.decodeTimeMs)) · process \(formatMs(streamController.stats.processingDelayMs))",
+                systemImage: "cpu"
+            )
+            Label(
+                "App \(pipeline.enqueuedFrames) enqueued · \(pipeline.droppedFrames) dropped · \(pipeline.backpressureEvents) backpressure",
+                systemImage: "rectangle.stack"
+            )
+            Label(
+                "Sample \(formatMs(pipeline.averageSampleCreationMs)) · convert \(formatMs(pipeline.averageConversionMs))",
+                systemImage: "timer"
+            )
+            Label(
+                "AV interval \(pipeline.avTotalFrames) frames · \(pipeline.avDroppedFrames) dropped · \(pipeline.avCorruptedFrames) corrupt · \(formatMs(pipeline.avAccumulatedFrameDelayMs)) late",
+                systemImage: "display"
+            )
+            if !streamController.stats.decoderImplementation.isEmpty {
+                Label(
+                    "\(streamController.stats.decoderImplementation)\(streamController.stats.powerEfficientDecoder == true ? " · hardware" : "")",
+                    systemImage: "video"
+                )
+            }
+            if streamController.rtcEventLogURL != nil {
+                Label("RTC event log active", systemImage: "doc.text.magnifyingglass")
+            }
+        }
+        .font(.caption2.monospacedDigit())
+        .foregroundStyle(.white.opacity(0.85))
+    }
+
+    private func formatMs(_ value: Double) -> String {
+        String(format: "%.2f ms", value)
     }
 
     private var remoteModeLabel: String {
@@ -343,6 +406,41 @@ struct StreamView: View {
 
     // MARK: Disconnected / Failed
 
+    private func reconnectingView(attempt: Int) -> some View {
+        VStack(spacing: 24) {
+            ProgressView()
+                .scaleEffect(1.5)
+            Text("Reconnecting…")
+                .font(.title2.weight(.semibold))
+                .foregroundStyle(.white)
+            Text("Attempt \(attempt) of 3")
+                .font(.body)
+                .foregroundStyle(.secondary)
+            Button("Cancel") { disconnect() }
+                .buttonStyle(.bordered)
+                .tint(.red)
+        }
+        .padding(60)
+    }
+
+    private var sessionEndedView: some View {
+        VStack(spacing: 24) {
+            Image(systemName: "checkmark.circle")
+                .font(.system(size: 60))
+                .foregroundStyle(.green)
+            Text("Session Ended")
+                .font(.title.weight(.bold))
+                .foregroundStyle(.white)
+            Text("Your game session has ended.")
+                .font(.body)
+                .foregroundStyle(.secondary)
+            Button("Exit") { disconnect() }
+                .buttonStyle(.bordered)
+                .tint(.blue)
+        }
+        .padding(60)
+    }
+
     private func disconnectedView(_ reason: String) -> some View {
         statusView(
             icon: "wifi.slash",
@@ -398,15 +496,19 @@ struct StreamView: View {
     // MARK: Actions
 
     private func startSession() async {
+        let settings = settings.normalizedForClient
+        streamLog.info("startSession: game=\(game.title), existingSession=\(existingSession != nil), directSession=\(directSession != nil)")
         // Reset stream controller (handles retry from failed/disconnected state)
         streamController.disconnect()
 
         // Reconnect path — RESUME PUT tells the server to rebuild its media endpoint,
         // then connect WebRTC as soon as we get a single status 2/3 (no double-poll wait).
         if let direct = directSession {
+            streamLog.info("startSession: direct reconnect path, sessionId=\(direct.sessionId)")
             loadingPhase = .preparing
             do {
                 let token = try await authManager.resolveToken()
+                streamLog.info("startSession: token resolved")
                 sessionToken = token
                 let provider = authManager.session?.provider
                 let streamingBaseUrl = provider?.streamingServiceUrl ?? NVIDIAAuth.defaultStreamingUrl
@@ -419,6 +521,7 @@ struct StreamView: View {
                     base: base,
                     settings: settings
                 )
+                streamLog.info("startSession: claimed session, status=\(sessionInfo.status)")
                 createdSession = sessionInfo
 
                 // Poll until ready, but only need a single status 2/3 (server media is up).
@@ -435,15 +538,18 @@ struct StreamView: View {
                         token: token,
                         base: sessionInfo.streamingBaseUrl,
                         serverIp: sessionInfo.serverIp.isEmpty ? nil : sessionInfo.serverIp,
+                        routingZoneUrl: sessionInfo.zone,
                         clientId: sessionInfo.clientId,
                         deviceId: sessionInfo.deviceId
                     )
                     createdSession = sessionInfo
                 }
 
+                streamLog.info("startSession: direct path ready, connecting WebRTC")
                 viewModel.recordPlayed(game)
                 await streamController.connect(session: sessionInfo, settings: settings)
             } catch {
+                streamLog.error("startSession: direct path failed: \(error)")
                 streamController.fail(with: error.localizedDescription)
             }
             return
@@ -452,6 +558,7 @@ struct StreamView: View {
         // Stop any previously created server session before opening a new one.
         // Skip for resume — we want to keep the existing session alive.
         if let session = createdSession, let token = sessionToken, existingSession == nil {
+            streamLog.info("startSession: stopping previous session \(session.sessionId)")
             try? await cloudMatchClient.stopSession(
                 sessionId: session.sessionId, token: token, base: session.streamingBaseUrl
             )
@@ -460,14 +567,17 @@ struct StreamView: View {
         loadingPhase = .finding
         do {
             let token = try await authManager.resolveToken()
+            streamLog.info("startSession: token resolved")
             sessionToken = token
             let provider = authManager.session?.provider
             let streamingBaseUrl = provider?.streamingServiceUrl ?? NVIDIAAuth.defaultStreamingUrl
             let base = streamingBaseUrl.hasSuffix("/") ? String(streamingBaseUrl.dropLast()) : streamingBaseUrl
+            streamLog.info("startSession: base=\(base)")
 
             var sessionInfo: SessionInfo
 
             if let existing = existingSession, let serverIp = existing.serverIp {
+                streamLog.info("startSession: resume path, sessionId=\(existing.sessionId)")
                 // Resume path: attach to the existing session without creating a new one
                 sessionInfo = try await cloudMatchClient.claimSession(
                     sessionId: existing.sessionId,
@@ -476,35 +586,55 @@ struct StreamView: View {
                     base: base,
                     settings: settings
                 )
+                streamLog.info("startSession: claimed, status=\(sessionInfo.status)")
             } else {
                 // New session path
-                guard let appId = game.variants.first?.appId ?? game.variants.first?.id else { return }
+                guard let appId = game.variants.first?.appId ?? game.variants.first?.id else {
+                    streamLog.error("startSession: no appId found for game")
+                    return
+                }
 
-                // Prefer the user-selected zone URL; fall back to the provider's default.
-                let sessionBase = settings.preferredZoneUrl ?? base
-
-                let request = SessionCreateRequest(
-                    appId: appId,
-                    internalTitle: game.title,
-                    token: token,
-                    zone: "",
-                    streamingBaseUrl: sessionBase,
-                    settings: settings,
-                    accountLinked: true
-                )
-
-                do {
-                    sessionInfo = try await cloudMatchClient.createSession(request)
-                } catch let CloudMatchError.sessionCreateFailed(msg) where msg.contains("SESSION_LIMIT_EXCEEDED") {
-                    // Stale server session is blocking creation — stop all active sessions and retry once.
-                    let staleSessions = await (try? cloudMatchClient.getActiveSessions(token: token, base: base)) ?? []
-                    for stale in staleSessions {
-                        try? await cloudMatchClient.stopSession(sessionId: stale.sessionId, token: token, base: base)
+                // Check for a locally saved session for this game — resume instead of creating new.
+                if let last = viewModel.lastSession, last.appId == appId {
+                    print("[Resume] found saved session \(last.sessionId) for appId=\(appId), trying resume")
+                    do {
+                        sessionInfo = try await cloudMatchClient.claimSession(
+                            sessionId: last.sessionId,
+                            serverIp: last.serverIp,
+                            token: token,
+                            base: last.base,
+                            settings: settings
+                        )
+                        print("[Resume] claimed session, status=\(sessionInfo.status)")
+                        createdSession = sessionInfo
+                    } catch {
+                        print("[Resume] claim failed: \(error), stopping old session and creating new")
+                        try? await cloudMatchClient.stopSession(sessionId: last.sessionId, token: token, base: last.base)
+                        viewModel.clearLastSession()
+                        // Fall through to create new session below
+                        sessionInfo = try await createNewSession(appId: appId, token: token, base: base)
                     }
-                    sessionInfo = try await cloudMatchClient.createSession(request)
+                } else {
+                    if let last = viewModel.lastSession {
+                        print("[Resume] saved session appId=\(last.appId) != game appId=\(appId), stopping it")
+                        try? await cloudMatchClient.stopSession(sessionId: last.sessionId, token: token, base: last.base)
+                        viewModel.clearLastSession()
+                    }
+                    sessionInfo = try await createNewSession(appId: appId, token: token, base: base)
                 }
             }
             createdSession = sessionInfo
+
+            // Persist session so we can resume it across app launches
+            if let appId = game.variants.first?.appId ?? game.variants.first?.id {
+                viewModel.saveLastSession(LastSessionRecord(
+                    sessionId: sessionInfo.sessionId,
+                    serverIp: sessionInfo.serverIp,
+                    appId: appId,
+                    base: sessionInfo.streamingBaseUrl,
+                    createdAt: Date()
+                ))
+            }
 
             // Poll with readyPollStreak confirmation (requires 2 consecutive ready polls).
             // While in queue: no timeout — user waits indefinitely with position updates.
@@ -540,16 +670,40 @@ struct StreamView: View {
                     token: token,
                     base: sessionInfo.streamingBaseUrl,
                     serverIp: sessionInfo.serverIp.isEmpty ? nil : sessionInfo.serverIp,
+                    routingZoneUrl: sessionInfo.zone,
                     clientId: sessionInfo.clientId,
                     deviceId: sessionInfo.deviceId
                 )
                 createdSession = sessionInfo
             }
 
+            streamLog.info("startSession: queue cleared, readyPollStreak=\(readyPollStreak), connecting WebRTC")
+            streamLog.info("startSession: serverIp=\(sessionInfo.serverIp), signalingUrl=\(sessionInfo.signalingUrl)")
             viewModel.recordPlayed(game)
             await streamController.connect(session: sessionInfo, settings: settings)
         } catch {
+            streamLog.error("startSession: FAILED: \(error)")
             streamController.fail(with: error.localizedDescription)
+        }
+    }
+
+    private func reclaimSession() async -> SessionInfo? {
+        guard let session = createdSession, let token = sessionToken else { return nil }
+        streamLog.info("reclaimSession: attempting to reclaim \(session.sessionId)")
+        do {
+            let reclaimed = try await cloudMatchClient.claimSession(
+                sessionId: session.sessionId,
+                serverIp: session.serverIp,
+                token: token,
+                base: session.streamingBaseUrl,
+                settings: settings
+            )
+            createdSession = reclaimed
+            streamLog.info("reclaimSession: success, status=\(reclaimed.status)")
+            return reclaimed
+        } catch {
+            streamLog.error("reclaimSession: failed: \(error)")
+            return nil
         }
     }
 
@@ -566,6 +720,7 @@ struct StreamView: View {
     private func disconnect() {
         // Intentional end — clear any pending resumable session
         viewModel.resumableSession = nil
+        viewModel.clearLastSession()
         // Tell the server to stop the session so it doesn't linger
         if let session = createdSession, let token = sessionToken {
             Task {
@@ -578,6 +733,31 @@ struct StreamView: View {
         }
         streamController.disconnect()
         onDismiss()
+    }
+
+    private func createNewSession(appId: String, token: String, base: String) async throws -> SessionInfo {
+        let sessionBase: String = if let preferred = settings.preferredZoneUrl {
+            preferred
+        } else if let best = await viewModel.bestZoneUrl() {
+            best
+        } else {
+            base
+        }
+        print("[Session] creating new session, appId=\(appId), sessionBase=\(sessionBase)")
+
+        let request = SessionCreateRequest(
+            appId: appId,
+            internalTitle: game.title,
+            token: token,
+            zone: "",
+            streamingBaseUrl: sessionBase,
+            settings: settings,
+            accountLinked: true
+        )
+
+        let sessionInfo = try await cloudMatchClient.createSession(request)
+        print("[Session] created, sessionId=\(sessionInfo.sessionId), status=\(sessionInfo.status)")
+        return sessionInfo
     }
 
     private func reportAd(id: String, action: AdAction, watchedMs: Int? = nil) {
