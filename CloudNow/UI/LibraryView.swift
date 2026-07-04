@@ -1,10 +1,14 @@
 import SwiftUI
 
-private enum LibrarySortOrder: String, CaseIterable {
+enum LibrarySortOrder: String, CaseIterable {
     case `default` = "Default"
     case titleAZ = "A → Z"
     case titleZA = "Z → A"
     case recentFirst = "Recently Played"
+
+    var label: String {
+        L10n.librarySortLabel(self)
+    }
 }
 
 struct LibraryView: View {
@@ -75,22 +79,22 @@ struct LibraryView: View {
                 Button {
                     Task { await viewModel.refreshLibrary(authManager: authManager) }
                 } label: {
-                    Label("Refresh Library", systemImage: "arrow.clockwise")
+                    Label(L10n.text("refresh_library"), systemImage: "arrow.clockwise")
                 }
                 .disabled(viewModel.isLibraryLoading)
 
                 Menu {
-                    Picker("Sort", selection: $sortOrder) {
+                    Picker(L10n.text("sort"), selection: $sortOrder) {
                         ForEach(LibrarySortOrder.allCases, id: \.self) { order in
-                            Text(order.rawValue).tag(order)
+                            Text(order.label).tag(order)
                         }
                     }
                 } label: {
-                    Label("Sort", systemImage: "arrow.up.arrow.down")
+                    Label(L10n.text("sort"), systemImage: "arrow.up.arrow.down")
                 }
             }
         }
-        .searchable(text: $searchText, prompt: games.isEmpty ? "Loading library…" : "Search \(games.count) games")
+        .searchable(text: $searchText, prompt: games.isEmpty ? Text(L10n.text("loading_library")) : Text(L10n.format("search_games_count", games.count)))
     }
 
     private var gameGrid: some View {
@@ -110,7 +114,7 @@ struct LibraryView: View {
                 if availableStores.count > 1 {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 12) {
-                            filterChip("All", isSelected: selectedStore == nil) { selectedStore = nil }
+                            filterChip(L10n.text("all"), isSelected: selectedStore == nil) { selectedStore = nil }
                             ForEach(availableStores, id: \.self) { store in
                                 filterChip(storeName(store), isSelected: selectedStore == store) {
                                     selectedStore = selectedStore == store ? nil : store
@@ -137,12 +141,12 @@ struct LibraryView: View {
                             } label: {
                                 let isFav = viewModel.favoriteIds.contains(game.id)
                                 Label(
-                                    isFav ? "Remove from Favorites" : "Add to Favorites",
+                                    isFav ? L10n.text("remove_from_favorites") : L10n.text("add_to_favorites"),
                                     systemImage: isFav ? "star.slash.fill" : "star"
                                 )
                             }
                             if game.variants.count > 1 {
-                                Menu("Launch via...") {
+                                Menu(L10n.text("launch_via")) {
                                     ForEach(game.variants, id: \.id) { variant in
                                         Button {
                                             viewModel.setPreferredStore(gameId: game.id, variantId: variant.id)
@@ -184,7 +188,7 @@ struct LibraryView: View {
             Image(systemName: viewModel.libraryError != nil ? "exclamationmark.triangle" : "books.vertical")
                 .font(.system(size: 60))
                 .foregroundStyle(.secondary)
-            Text(viewModel.libraryError != nil ? "Library Failed to Load" : "Library Empty")
+            Text(viewModel.libraryError != nil ? L10n.text("library_failed_to_load") : L10n.text("library_empty"))
                 .font(.title2.weight(.semibold))
                 .foregroundStyle(.white)
             if let err = viewModel.libraryError ?? viewModel.error {
@@ -193,7 +197,7 @@ struct LibraryView: View {
                     .foregroundStyle(.red.opacity(0.8))
                     .multilineTextAlignment(.center)
             } else {
-                Text("Games you own or have linked will appear here.")
+                Text(L10n.text("games_you_own_or_have_linked_will_appear_here"))
                     .font(.body)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
