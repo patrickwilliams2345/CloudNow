@@ -151,6 +151,7 @@ final class GFNStreamController: NSObject {
     private var peerConnection: LKRTCPeerConnection?
     private var inputDataChannel: LKRTCDataChannel?
     @ObservationIgnored private nonisolated(unsafe) var reliableSendChannel: LKRTCDataChannel?
+    @ObservationIgnored private nonisolated(unsafe) var rumbleSink: ((Int, UInt16, UInt16) -> Void)?
     @ObservationIgnored private nonisolated(unsafe) var inputGenerated: UInt64 = 0
     @ObservationIgnored private nonisolated(unsafe) var inputSubmitted: UInt64 = 0
     @ObservationIgnored private nonisolated(unsafe) var inputAccepted: UInt64 = 0
@@ -180,6 +181,8 @@ final class GFNStreamController: NSObject {
     private var partialReliableThresholdMs = 300
     private var sessionInfo: SessionInfo?
     private var settings = StreamSettings()
+    /// Account HDR entitlement resolved from the subscription tier at connect time.
+    private var accountAllowsHDR: Bool?
     private var micAudioSource: LKRTCAudioSource?
     private var micAudioTrack: LKRTCAudioTrack?
     private var signalingComplete = false
@@ -202,13 +205,13 @@ final class GFNStreamController: NSObject {
     private static let factory: LKRTCPeerConnectionFactory = {
         LKRTCInitializeSSL()
         let encoderFactory = LKRTCDefaultVideoEncoderFactory()
-        let decoderFactory = LKRTCDefaultVideoDecoderFactory()
+        let decoderFactory = GFNVideoDecoderFactory()
         return LKRTCPeerConnectionFactory(encoderFactory: encoderFactory, decoderFactory: decoderFactory)
     }()
 
     // MARK: Connect
 
-    func connect(session: SessionInfo, settings: StreamSettings) async {
+    func connect(session: SessionInfo, settings: StreamSettings, accountAllowsHDR: Bool? = nil) async {
         // Block if already active; allow from idle, disconnected, or failed (retry case)
         let currentState = state
         switch currentState {
@@ -219,12 +222,13 @@ final class GFNStreamController: NSObject {
         }
         let settings = settings.normalizedForClient
         let localCapabilities = LocalVideoCapabilities.detect(codec: settings.codec)
-        let colorRequest = settings.colorRequest(localCapabilities: localCapabilities)
+        let colorRequest = settings.colorRequest(localCapabilities: localCapabilities, accountAllowsHDR: accountAllowsHDR)
         gfnLog.info("connect: starting, serverIp=\(session.serverIp), signalingUrl=\(session.signalingUrl)")
         videoColorLog.info("request preference=\(settings.colorPreference.rawValue) requested=\(colorRequest.mode.rawValue) bitDepth=\(colorRequest.bitDepth) hdr=\(colorRequest.hdrRequested) codec=\(settings.codec.rawValue) decoder10Bit=\(localCapabilities.supportsHardware10BitDecode) hdrPipeline=\(localCapabilities.supportsHDRRendering) displayHDR=\(localCapabilities.displaySupportsHDR)")
         state = .connecting
         sessionInfo = session
         self.settings = settings
+        self.accountAllowsHDR = accountAllowsHDR
         colorState = StreamColorState(
             preference: settings.colorPreference,
             requestedMode: colorRequest.mode,
@@ -373,6 +377,7 @@ final class GFNStreamController: NSObject {
             inputDropped &+= UInt64(pending.count)
             pending.forEach { $0.completion(.channelUnavailable) }
         }
+        inputSendQueue.async { [weak self] in self?.rumbleSink = nil }
         partiallyReliableDataChannel = nil
         controlChannel = nil
         videoTrack = nil
@@ -663,7 +668,7 @@ final class GFNStreamController: NSObject {
             }
             // Apply codec preference to the answer (not the offer) — avoids the
             // orphaned FEC-FR SSRC issue that caused video port 0 when munging the offer.
-            let answerColorRequest = settings.colorRequest(localCapabilities: .detect(codec: settings.codec))
+            let answerColorRequest = settings.colorRequest(localCapabilities: .detect(codec: settings.codec), accountAllowsHDR: accountAllowsHDR)
             let codecFilteredSdp = SDPMunger.preferCodec(
                 answer.sdp,
                 codec: settings.codec,
@@ -675,6 +680,10 @@ final class GFNStreamController: NSObject {
                 ? SDPMunger.rewriteH265LevelId(SDPMunger.rewriteH265TierFlag(codecFilteredSdp))
                 : codecFilteredSdp
             let mangledAnswerSdp = SDPMunger.injectBandwidth(h265SafeSdp, videoKbps: settings.maxBitrateKbps)
+            let answerH265Params = mangledAnswerSdp.components(separatedBy: "\r\n")
+                .filter { ($0.hasPrefix("a=rtpmap:") && $0.contains("H265")) || ($0.hasPrefix("a=fmtp:") && $0.contains("profile-id")) }
+                .joined(separator: " ")
+            videoColorLog.info("answer H265: \(answerH265Params.isEmpty ? "none" : answerH265Params)")
             #if DEBUG
                 print("[Stream] Answer SDP (\(mangledAnswerSdp.count) chars):")
                 mangledAnswerSdp.components(separatedBy: "\r\n").forEach { print("  \($0)") }
@@ -797,7 +806,7 @@ final class GFNStreamController: NSObject {
             "a=vqos.bw.maximumBitrateKbps:\(settings.maxBitrateKbps)",
             "a=vqos.bw.minimumBitrateKbps:\(minBitrateKbps)",
             "a=vqos.bw.peakBitrateKbps:\(settings.maxBitrateKbps)",
-            "a=video.bitDepth:\(settings.colorRequest(localCapabilities: .detect(codec: settings.codec)).bitDepth)",
+            "a=video.bitDepth:\(settings.colorRequest(localCapabilities: .detect(codec: settings.codec), accountAllowsHDR: accountAllowsHDR).bitDepth)",
             "m=audio 0 RTP/AVP",
             "a=msid:audio",
         ]
@@ -1505,6 +1514,13 @@ extension GFNStreamController: LKRTCDataChannelDelegate {
             version = Int(firstWord)
             print("[DataChannel] Handshake: byte[0]=0x0e, version=\(version)")
         } else {
+            if let cmd = GFNHapticsDecoder.decode(buffer.data) {
+                print("[Rumble] inbound controller=\(cmd.controllerId) weak=\(cmd.weak) strong=\(cmd.strong)")
+                inputSendQueue.async { [weak self] in
+                    self?.rumbleSink?(cmd.controllerId, cmd.weak, cmd.strong)
+                }
+                return
+            }
             print("[DataChannel] Non-handshake message on \(dataChannel.label): firstWord=\(firstWord) (0x\(String(firstWord, radix: 16)))")
             return
         }
@@ -1521,7 +1537,9 @@ extension GFNStreamController: LKRTCDataChannelDelegate {
                 deadzone: Float(settings.controllerDeadzone),
                 overlayTriggerButton: settings.overlayTriggerButton,
                 steamOverlayGestureEnabled: settings.enableSteamOverlayGesture,
-                remoteMode: settings.defaultRemoteInputMode
+                remoteMode: settings.defaultRemoteInputMode,
+                rumbleEnabled: settings.rumbleEnabled,
+                rumbleIntensity: Float(settings.rumbleIntensity)
             )
             remoteMode = settings.defaultRemoteInputMode
             videoView?.gamepadModeActive = (remoteMode == .gamepad || remoteMode == .dualsense)
@@ -1532,6 +1550,9 @@ extension GFNStreamController: LKRTCDataChannelDelegate {
             }
             sender.start()
             inputSender = sender
+            inputSendQueue.async { [weak self, weak sender] in
+                self?.rumbleSink = { sender?.applyRumble(controllerId: $0, weak: $1, strong: $2) }
+            }
             // Forward keyboard/mouse events from the video surface to the sender
             videoView?.inputHandler = sender
         }

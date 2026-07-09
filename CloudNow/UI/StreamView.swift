@@ -23,6 +23,7 @@ struct StreamView: View {
 
     @Environment(AuthManager.self) var authManager
     @Environment(GamesViewModel.self) var viewModel
+    @Environment(\.colorScheme) private var colorScheme
     @State private var streamController = GFNStreamController()
     @State private var showOverlay = false
     @State private var showExitConfirmation = false
@@ -36,7 +37,7 @@ struct StreamView: View {
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            hostBackground.ignoresSafeArea()
 
             switch streamController.state {
             case .idle, .connecting:
@@ -89,11 +90,11 @@ struct StreamView: View {
             } else {
                 ProgressView()
                     .scaleEffect(2)
-                    .tint(.white)
+                    .tint(hostPrimaryForegroundColor)
             }
             Text(L10n.format("starting_game", game.title))
                 .font(.title2.weight(.semibold))
-                .foregroundStyle(.white)
+                .foregroundStyle(hostPrimaryForegroundColor)
             Text(loadingLabel)
                 .font(.body)
                 .foregroundStyle(.secondary)
@@ -492,7 +493,7 @@ struct StreamView: View {
                 .scaleEffect(1.5)
             Text(L10n.text("reconnecting"))
                 .font(.title2.weight(.semibold))
-                .foregroundStyle(.white)
+                .foregroundStyle(hostPrimaryForegroundColor)
             Text(L10n.format("attempt_of", attempt))
                 .font(.body)
                 .foregroundStyle(.secondary)
@@ -510,7 +511,7 @@ struct StreamView: View {
                 .foregroundStyle(.green)
             Text(L10n.text("session_ended"))
                 .font(.title.weight(.bold))
-                .foregroundStyle(.white)
+                .foregroundStyle(hostPrimaryForegroundColor)
             Text(L10n.text("your_game_session_has_ended"))
                 .font(.body)
                 .foregroundStyle(.secondary)
@@ -556,7 +557,7 @@ struct StreamView: View {
                 .foregroundStyle(color)
             Text(title)
                 .font(.title.weight(.bold))
-                .foregroundStyle(.white)
+                .foregroundStyle(hostPrimaryForegroundColor)
             Text(message)
                 .font(.body)
                 .foregroundStyle(.secondary)
@@ -571,6 +572,37 @@ struct StreamView: View {
             }
         }
         .padding(60)
+    }
+
+    @ViewBuilder
+    private var hostBackground: some View {
+        if colorScheme == .dark {
+            Color(white: 29.0 / 255.0)
+        } else {
+            LinearGradient(
+                colors: [
+                    Color(white: 0.74),
+                    Color(white: 0.68),
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .overlay {
+                RadialGradient(
+                    colors: [
+                        Color.white.opacity(0.16),
+                        .clear,
+                    ],
+                    center: .top,
+                    startRadius: 0,
+                    endRadius: 1100
+                )
+            }
+        }
+    }
+
+    private var hostPrimaryForegroundColor: Color {
+        colorScheme == .dark ? .white : .black
     }
 
     // MARK: Actions
@@ -603,7 +635,8 @@ struct StreamView: View {
                     clientId: direct.clientId,
                     deviceId: direct.deviceId,
                     appId: game.variants.first?.appId ?? game.variants.first?.id,
-                    settings: settings
+                    settings: settings,
+                    accountAllowsHDR: viewModel.subscription?.allowsHDR
                 )
                 streamLog.info("startSession: claimed session, status=\(sessionInfo.status)")
                 createdSession = sessionInfo
@@ -631,7 +664,7 @@ struct StreamView: View {
 
                 streamLog.info("startSession: direct path ready, connecting WebRTC")
                 viewModel.recordPlayed(game)
-                await streamController.connect(session: sessionInfo, settings: settings)
+                await streamController.connect(session: sessionInfo, settings: settings, accountAllowsHDR: viewModel.subscription?.allowsHDR)
             } catch {
                 streamLog.error("startSession: direct path failed: \(error)")
                 streamController.fail(with: error.localizedDescription)
@@ -683,7 +716,8 @@ struct StreamView: View {
                         ? viewModel.lastSession?.deviceId
                         : nil,
                     appId: existing.appId,
-                    settings: settings
+                    settings: settings,
+                    accountAllowsHDR: viewModel.subscription?.allowsHDR
                 )
                 streamLog.info("startSession: claimed, status=\(sessionInfo.status)")
             } else {
@@ -706,7 +740,8 @@ struct StreamView: View {
                             clientId: last.clientId,
                             deviceId: last.deviceId,
                             appId: last.appId,
-                            settings: settings
+                            settings: settings,
+                            accountAllowsHDR: viewModel.subscription?.allowsHDR
                         )
                         print("[Resume] claimed session, status=\(sessionInfo.status)")
                         createdSession = sessionInfo
@@ -800,7 +835,7 @@ struct StreamView: View {
             streamLog.info("startSession: queue cleared, readyPollStreak=\(readyPollStreak), connecting WebRTC")
             streamLog.info("startSession: serverIp=\(sessionInfo.serverIp), signalingUrl=\(sessionInfo.signalingUrl)")
             viewModel.recordPlayed(game)
-            await streamController.connect(session: sessionInfo, settings: settings)
+            await streamController.connect(session: sessionInfo, settings: settings, accountAllowsHDR: viewModel.subscription?.allowsHDR)
         } catch {
             streamLog.error("startSession: FAILED: \(error)")
             streamController.fail(with: error.localizedDescription)
@@ -820,7 +855,8 @@ struct StreamView: View {
                 clientId: session.clientId,
                 deviceId: session.deviceId,
                 appId: game.variants.first?.appId ?? game.variants.first?.id,
-                settings: settings
+                settings: settings,
+                accountAllowsHDR: viewModel.subscription?.allowsHDR
             )
             createdSession = reclaimed
             streamLog.info("reclaimSession: success, status=\(reclaimed.status)")
@@ -879,7 +915,8 @@ struct StreamView: View {
             streamingBaseUrl: routeSelection.base,
             routingZoneUrl: routeSelection.routingZoneUrl,
             settings: settings,
-            accountLinked: true
+            accountLinked: true,
+            accountAllowsHDR: viewModel.subscription?.allowsHDR
         )
 
         do {

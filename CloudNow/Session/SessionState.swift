@@ -6,6 +6,8 @@ struct StreamSettings: Codable, Equatable {
     static let maxSelectableBitrateKbps = 100_000
     static let minControllerDeadzone = 0.0
     static let maxControllerDeadzone = 0.30
+    static let minRumbleIntensity = 0.0
+    static let maxRumbleIntensity = 2.0
     static let defaultKeyboardLayout = L10n.keyboardLayoutCode()
     static let automaticGameLanguage = "automatic"
     static let defaultGameLanguage = automaticGameLanguage
@@ -22,6 +24,12 @@ struct StreamSettings: Codable, Equatable {
     var gameLanguage: String = Self.defaultGameLanguage
     var enableL4S: Bool = false
     var micEnabled: Bool = false
+    var rumbleEnabled: Bool = true
+    /// Rumble power multiplier (0.0–2.0, 1.0 = default). Higher stresses controller motors.
+    var rumbleIntensity: Double = 1.0 {
+        didSet { rumbleIntensity = min(max(rumbleIntensity, Self.minRumbleIntensity), Self.maxRumbleIntensity) }
+    }
+
     /// Radial deadzone applied to analog stick axes (0.0–1.0). Default 15%.
     var controllerDeadzone: Double = 0.15 {
         didSet { controllerDeadzone = min(max(controllerDeadzone, Self.minControllerDeadzone), Self.maxControllerDeadzone) }
@@ -41,6 +49,10 @@ struct StreamSettings: Codable, Equatable {
     var statsMode: StreamStatsMode = .hud
     /// Captures a bounded WebRTC event log for the duration of the next stream.
     var enableRtcEventLog: Bool = false
+    /// How the GFN server presents launched games. Big Picture requests the "GamepadFriendly"
+    /// mode that NVIDIA's TV clients (e.g. Shield TV) use, opening launchers such as Steam
+    /// in their TV interface — the natural default for a TV client.
+    var appLaunchMode: AppLaunchMode = .bigPicture
 
     var normalizedForClient: StreamSettings {
         var normalized = self
@@ -64,10 +76,11 @@ struct StreamSettings: Codable, Equatable {
 extension StreamSettings {
     enum CodingKeys: String, CodingKey {
         case resolution, fps, maxBitrateKbps, codec, colorPreference, keyboardLayout
-        case gameLanguage, enableL4S, micEnabled, controllerDeadzone, overlayTriggerButton
+        case gameLanguage, enableL4S, micEnabled, rumbleEnabled, rumbleIntensity, controllerDeadzone, overlayTriggerButton
         case defaultRemoteInputMode, preferredZoneUrl
         case enableSteamOverlayGesture
         case statsMode, enableRtcEventLog
+        case appLaunchMode
         case colorQuality
     }
 
@@ -86,6 +99,8 @@ extension StreamSettings {
         gameLanguage = try c.decodeIfPresent(String.self, forKey: .gameLanguage) ?? d.gameLanguage
         enableL4S = try c.decodeIfPresent(Bool.self, forKey: .enableL4S) ?? d.enableL4S
         micEnabled = try c.decodeIfPresent(Bool.self, forKey: .micEnabled) ?? d.micEnabled
+        rumbleEnabled = try c.decodeIfPresent(Bool.self, forKey: .rumbleEnabled) ?? d.rumbleEnabled
+        rumbleIntensity = try c.decodeIfPresent(Double.self, forKey: .rumbleIntensity) ?? d.rumbleIntensity
         controllerDeadzone = try c.decodeIfPresent(Double.self, forKey: .controllerDeadzone) ?? d.controllerDeadzone
         overlayTriggerButton = try c.decodeIfPresent(OverlayTriggerButton.self, forKey: .overlayTriggerButton) ?? d.overlayTriggerButton
         defaultRemoteInputMode = try c.decodeIfPresent(RemoteInputMode.self, forKey: .defaultRemoteInputMode) ?? d.defaultRemoteInputMode
@@ -93,6 +108,7 @@ extension StreamSettings {
         enableSteamOverlayGesture = try c.decodeIfPresent(Bool.self, forKey: .enableSteamOverlayGesture) ?? d.enableSteamOverlayGesture
         statsMode = try c.decodeIfPresent(StreamStatsMode.self, forKey: .statsMode) ?? d.statsMode
         enableRtcEventLog = try c.decodeIfPresent(Bool.self, forKey: .enableRtcEventLog) ?? d.enableRtcEventLog
+        appLaunchMode = try c.decodeIfPresent(AppLaunchMode.self, forKey: .appLaunchMode) ?? d.appLaunchMode
     }
 
     func encode(to encoder: Encoder) throws {
@@ -106,6 +122,8 @@ extension StreamSettings {
         try c.encode(gameLanguage, forKey: .gameLanguage)
         try c.encode(enableL4S, forKey: .enableL4S)
         try c.encode(micEnabled, forKey: .micEnabled)
+        try c.encode(rumbleEnabled, forKey: .rumbleEnabled)
+        try c.encode(rumbleIntensity, forKey: .rumbleIntensity)
         try c.encode(controllerDeadzone, forKey: .controllerDeadzone)
         try c.encode(overlayTriggerButton, forKey: .overlayTriggerButton)
         try c.encode(defaultRemoteInputMode, forKey: .defaultRemoteInputMode)
@@ -113,6 +131,7 @@ extension StreamSettings {
         try c.encode(enableSteamOverlayGesture, forKey: .enableSteamOverlayGesture)
         try c.encode(statsMode, forKey: .statsMode)
         try c.encode(enableRtcEventLog, forKey: .enableRtcEventLog)
+        try c.encode(appLaunchMode, forKey: .appLaunchMode)
     }
 }
 
@@ -136,6 +155,20 @@ enum OverlayTriggerButton: String, Codable, CaseIterable {
 
     var label: String {
         L10n.overlayTriggerButtonLabel(self)
+    }
+}
+
+enum AppLaunchMode: String, Codable, CaseIterable {
+    case `default`
+    case bigPicture
+
+    /// CloudMatch sessionRequestData wire values: 1 = Default, 2 = GamepadFriendly, 3 = TouchFriendly.
+    var cloudMatchValue: Int {
+        self == .bigPicture ? 2 : 1
+    }
+
+    var label: String {
+        L10n.appLaunchModeLabel(self)
     }
 }
 
@@ -295,12 +328,15 @@ struct StreamColorRequest: Codable, Equatable {
             }
             return capabilities.decoderSupports10Bit ? .sdr10 : .sdr8
         case .automatic:
-            if capabilities.gameHDRSupport == .supported,
+            // Game and server HDR support are permissive on unknown — GFN falls back to an
+            // SDR encode inside an HDR-capable session when the title doesn't support HDR.
+            // Account entitlement must be positively known so Free tiers don't request HDR.
+            if capabilities.gameHDRSupport != .unsupported,
                capabilities.decoderSupports10Bit,
                capabilities.hdrRenderPipelineAvailable,
                capabilities.displaySupportsHDR,
                capabilities.accountAllowsHDR == true,
-               capabilities.serverAllowsHDR == true
+               capabilities.serverAllowsHDR != false
             {
                 return .hdr10
             }
@@ -444,6 +480,16 @@ struct SubscriptionInfo {
     let remainingMinutes: Int?
     let totalMinutes: Int?
     let entitledResolutions: [EntitledResolution]
+
+    /// HDR entitlement by tier: Ultimate and Performance (formerly Priority) stream HDR,
+    /// Free is SDR-only. Unrecognized tiers stay undetermined (nil).
+    var allowsHDR: Bool? {
+        let tier = membershipTier.uppercased()
+        if tier.contains("ULTIMATE") || tier.contains("PERFORMANCE") || tier.contains("PRIORITY") {
+            return true
+        }
+        return tier.contains("FREE") ? false : nil
+    }
 }
 
 // MARK: - Games
@@ -493,4 +539,5 @@ struct SessionCreateRequest {
     let routingZoneUrl: String?
     let settings: StreamSettings
     let accountLinked: Bool
+    let accountAllowsHDR: Bool?
 }
