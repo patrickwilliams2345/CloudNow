@@ -56,9 +56,16 @@ private struct CloudMatchResponse: Decodable {
             seatSetupStep ?? seatSetupInfo?.seatSetupStep
         }
 
+        /// Estimated time remaining for queue/setup, in milliseconds (0 when unknown).
+        var resolvedSeatSetupEtaMs: Int? {
+            guard let eta = seatSetupInfo?.seatSetupEta, eta > 0 else { return nil }
+            return eta
+        }
+
         struct SeatSetupInfo: Decodable {
             let queuePosition: Int?
             let seatSetupStep: Int?
+            let seatSetupEta: Int?
         }
 
         struct SessionProgress: Decodable {
@@ -221,7 +228,7 @@ private func buildSessionRequestBody(_ input: SessionCreateRequest, deviceId: St
             "secureRTSPSupported": false,
             "partnerCustomData": "",
             "accountLinked": input.accountLinked,
-            "enablePersistingInGameSettings": true,
+            "enablePersistingInGameSettings": input.settings.persistInGameSettings,
             "userAge": 26,
             "requestedStreamingFeatures": [
                 "reflex": input.settings.fps >= 120,
@@ -281,6 +288,7 @@ private func buildResumeSessionRequestData(appId: String?, settings: StreamSetti
         "sdrHdrMode": cloudMatchSdrHdrMode(color),
         "clientDisplayHdrCapabilities": cloudMatchDisplayCapabilities(color),
         "appLaunchMode": settings.appLaunchMode.cloudMatchValue,
+        "enablePersistingInGameSettings": settings.persistInGameSettings,
         "requestedStreamingFeatures": [
             "reflex": settings.fps >= 120,
             "bitDepth": cloudMatchBitDepth(color),
@@ -753,6 +761,7 @@ actor CloudMatchClient {
             gpuType: s.gpuType,
             queuePosition: s.resolvedQueuePosition,
             seatSetupStep: s.resolvedSeatSetupStep,
+            seatSetupEtaMs: s.resolvedSeatSetupEtaMs,
             iceServers: iceServers,
             mediaConnectionInfo: media,
             clientId: clientId,
