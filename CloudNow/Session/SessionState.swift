@@ -1,3 +1,4 @@
+import AVFAudio
 import Foundation
 
 // MARK: - Stream Settings
@@ -45,8 +46,12 @@ struct StreamSettings: Codable, Equatable {
     /// Long-press the button that is NOT the overlay trigger to send Shift+Tab (opens the
     /// Steam in-game overlay). e.g. with overlay on Start, long-press View/Back triggers Steam.
     var enableSteamOverlayGesture: Bool = true
-    /// Controls receiver statistics collection. Diagnostic mode also enables video-pipeline tracing.
-    var statsMode: StreamStatsMode = .hud
+    /// Level of the in-game statistics HUD (cycled from the pause menu, like the
+    /// official client's Statistics overlay).
+    var statsMode: StreamStatsMode = .off
+    /// Developer diagnostics: video-pipeline tracing, AudioSync logging, debug stats rows,
+    /// and RTC event log eligibility. Independent of the statistics HUD level.
+    var diagnosticsEnabled: Bool = false
     /// Captures a bounded WebRTC event log for the duration of the next stream.
     var enableRtcEventLog: Bool = false
     /// How the GFN server presents launched games. Big Picture requests the "GamepadFriendly"
@@ -56,10 +61,13 @@ struct StreamSettings: Codable, Equatable {
     /// Persist in-game graphics settings across sessions on the cloud rig. A premium-tier
     /// (Performance/Ultimate) feature; the server ignores the flag for non-entitled accounts.
     var persistInGameSettings: Bool = true
+    /// Requested audio channel layout. Automatic follows the connected audio system's
+    /// capability (5.1 only when the route reports ≥6 output channels).
+    var audioFormat: AudioFormatPreference = .automatic
 
     var normalizedForClient: StreamSettings {
         var normalized = self
-        if normalized.statsMode != .diagnostic {
+        if !normalized.diagnosticsEnabled {
             normalized.enableRtcEventLog = false
         }
         return normalized
@@ -82,9 +90,10 @@ extension StreamSettings {
         case gameLanguage, enableL4S, micEnabled, rumbleEnabled, rumbleIntensity, controllerDeadzone, overlayTriggerButton
         case defaultRemoteInputMode, preferredZoneUrl
         case enableSteamOverlayGesture
-        case statsMode, enableRtcEventLog
+        case statsMode, diagnosticsEnabled, enableRtcEventLog
         case appLaunchMode
         case persistInGameSettings
+        case audioFormat
         case colorQuality
     }
 
@@ -110,10 +119,22 @@ extension StreamSettings {
         defaultRemoteInputMode = try c.decodeIfPresent(RemoteInputMode.self, forKey: .defaultRemoteInputMode) ?? d.defaultRemoteInputMode
         preferredZoneUrl = try c.decodeIfPresent(String.self, forKey: .preferredZoneUrl)
         enableSteamOverlayGesture = try c.decodeIfPresent(Bool.self, forKey: .enableSteamOverlayGesture) ?? d.enableSteamOverlayGesture
-        statsMode = try c.decodeIfPresent(StreamStatsMode.self, forKey: .statsMode) ?? d.statsMode
+        // statsMode is decoded as a raw string: older builds persisted "hud" (pause-menu-only
+        // stats, now unconditional → .off) and "diagnostic" (now the separate diagnosticsEnabled
+        // flag, with the HUD at .standard so those users keep full visibility).
+        let rawStatsMode = (try? c.decodeIfPresent(String.self, forKey: .statsMode)) ?? nil
+        switch rawStatsMode {
+        case "hud": statsMode = .off
+        case "diagnostic": statsMode = .standard
+        case let raw?: statsMode = StreamStatsMode(rawValue: raw) ?? d.statsMode
+        case nil: statsMode = d.statsMode
+        }
+        let storedDiagnostics = try c.decodeIfPresent(Bool.self, forKey: .diagnosticsEnabled)
+        diagnosticsEnabled = rawStatsMode == "diagnostic" || (storedDiagnostics ?? d.diagnosticsEnabled)
         enableRtcEventLog = try c.decodeIfPresent(Bool.self, forKey: .enableRtcEventLog) ?? d.enableRtcEventLog
         appLaunchMode = try c.decodeIfPresent(AppLaunchMode.self, forKey: .appLaunchMode) ?? d.appLaunchMode
         persistInGameSettings = try c.decodeIfPresent(Bool.self, forKey: .persistInGameSettings) ?? d.persistInGameSettings
+        audioFormat = try c.decodeIfPresent(AudioFormatPreference.self, forKey: .audioFormat) ?? d.audioFormat
     }
 
     func encode(to encoder: Encoder) throws {
@@ -135,22 +156,35 @@ extension StreamSettings {
         try c.encodeIfPresent(preferredZoneUrl, forKey: .preferredZoneUrl)
         try c.encode(enableSteamOverlayGesture, forKey: .enableSteamOverlayGesture)
         try c.encode(statsMode, forKey: .statsMode)
+        try c.encode(diagnosticsEnabled, forKey: .diagnosticsEnabled)
         try c.encode(enableRtcEventLog, forKey: .enableRtcEventLog)
         try c.encode(appLaunchMode, forKey: .appLaunchMode)
         try c.encode(persistInGameSettings, forKey: .persistInGameSettings)
+        try c.encode(audioFormat, forKey: .audioFormat)
     }
 }
 
+/// Level of the in-game statistics HUD, mirroring the official client's Statistics
+/// overlay (Off → Compact → Standard).
 enum StreamStatsMode: String, Codable, CaseIterable {
     case off
-    case hud
-    case diagnostic
+    case compact
+    case standard
 
     var label: String {
         switch self {
         case .off: L10n.text("off")
-        case .hud: L10n.text("hud")
-        case .diagnostic: L10n.text("diagnostic")
+        case .compact: L10n.text("compact")
+        case .standard: L10n.text("standard")
+        }
+    }
+
+    /// Pause-menu cycle order, matching the official client's stats hotkey.
+    var nextHUDLevel: StreamStatsMode {
+        switch self {
+        case .off: .compact
+        case .compact: .standard
+        case .standard: .off
         }
     }
 }
@@ -175,6 +209,38 @@ enum AppLaunchMode: String, Codable, CaseIterable {
 
     var label: String {
         L10n.appLaunchModeLabel(self)
+    }
+}
+
+enum AudioFormatPreference: String, Codable, CaseIterable {
+    case automatic
+    case stereo
+    case surround51
+
+    var label: String {
+        switch self {
+        case .automatic: L10n.text("automatic")
+        case .stereo: L10n.text("stereo")
+        case .surround51: L10n.text("surround_5_1")
+        }
+    }
+
+    /// Output channels to request from GFN (2 or 6). tvOS exposes no reliable sink-capability
+    /// API (device-verified: the port's channel count reports the currently active format —
+    /// always 2 before anything requests more — and maximumOutputNumberOfChannels reports the
+    /// OS mixer's 32 on one setup but the sink chain's 8 on another). Automatic therefore
+    /// requests 5.1 on any surround-capable route and lets tvOS downmix to the actual
+    /// speakers — the benign failure mode: real 5.1 rooms get discrete surround, stereo
+    /// rooms get the same graceful 6→2 downmix every video app uses for 5.1 content.
+    var resolvedChannelCount: Int {
+        switch self {
+        case .stereo:
+            2
+        case .surround51:
+            6
+        case .automatic:
+            AVAudioSession.sharedInstance().maximumOutputNumberOfChannels >= 6 ? 6 : 2
+        }
     }
 }
 

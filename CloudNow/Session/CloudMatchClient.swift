@@ -177,6 +177,7 @@ private func resolutionPixels(for settings: StreamSettings) -> (width: Int, heig
 private func buildSessionRequestBody(_ input: SessionCreateRequest, deviceId: String) -> [String: Any] {
     let (width, height) = resolutionPixels(for: input.settings)
     let tzOffset = TimeZone.current.secondsFromGMT() * 1000
+    let audioChannels = input.settings.audioFormat.resolvedChannelCount
     let color = input.settings.colorRequest(
         localCapabilities: .detect(codec: input.settings.codec),
         accountAllowsHDR: input.accountAllowsHDR
@@ -208,7 +209,11 @@ private func buildSessionRequestBody(_ input: SessionCreateRequest, deviceId: St
                 "dpi": 100,
             ]],
             "useOps": true,
-            "audioMode": 2,
+            // Channel count, like the official client (audioMode = audioChannelCount).
+            // surroundAudioInfo alone only switches the TRANSPORT to multiopus; audioMode
+            // configures the rig's audio endpoint — leaving it at 2 makes games render
+            // stereo, so the rear channels of a negotiated 5.1 stream stay silent.
+            "audioMode": audioChannels,
             "metaData": [
                 ["key": "SubSessionId", "value": UUID().uuidString],
                 ["key": "wssignaling", "value": "1"],
@@ -216,11 +221,14 @@ private func buildSessionRequestBody(_ input: SessionCreateRequest, deviceId: St
                 ["key": "networkType", "value": "Unknown"],
                 ["key": "ClientImeSupport", "value": "0"],
                 ["key": "clientPhysicalResolution", "value": "{\"horizontalPixels\":\(width),\"verticalPixels\":\(height)}"],
-                ["key": "surroundAudioInfo", "value": "2"],
+                ["key": "surroundAudioInfo", "value": "\(audioChannels)"],
             ],
             "sdrHdrMode": cloudMatchSdrHdrMode(color),
             "clientDisplayHdrCapabilities": cloudMatchDisplayCapabilities(color),
-            "surroundAudioInfo": 0,
+            // GameStream encoding (channelMask << 16) | channels: 5.1 = (0x3F << 16) | 6.
+            // 0 (unset) keeps the server's stereo default. Probe-verified: with 5.1 the
+            // server offers multiopus/48000/6 instead of stereo opus.
+            "surroundAudioInfo": audioChannels >= 6 ? 4_128_774 : 0,
             "remoteControllersBitmap": 0,
             "clientTimezoneOffset": tzOffset,
             "enhancedStreamMode": 1,
@@ -249,6 +257,7 @@ private func buildSessionRequestBody(_ input: SessionCreateRequest, deviceId: St
 
 private func buildResumeSessionRequestData(appId: String?, settings: StreamSettings, deviceId: String, accountAllowsHDR: Bool?) -> [String: Any] {
     let (width, height) = resolutionPixels(for: settings)
+    let audioChannels = settings.audioFormat.resolvedChannelCount
     let color = settings.colorRequest(
         localCapabilities: .detect(codec: settings.codec),
         accountAllowsHDR: accountAllowsHDR
@@ -283,10 +292,11 @@ private func buildResumeSessionRequestData(appId: String?, settings: StreamSetti
             ["key": "networkType", "value": "Unknown"],
             ["key": "ClientImeSupport", "value": "0"],
             ["key": "clientPhysicalResolution", "value": "{\"horizontalPixels\":\(width),\"verticalPixels\":\(height)}"],
-            ["key": "surroundAudioInfo", "value": "2"],
+            ["key": "surroundAudioInfo", "value": "\(audioChannels)"],
         ],
         "sdrHdrMode": cloudMatchSdrHdrMode(color),
         "clientDisplayHdrCapabilities": cloudMatchDisplayCapabilities(color),
+        "surroundAudioInfo": audioChannels >= 6 ? 4_128_774 : 0,
         "appLaunchMode": settings.appLaunchMode.cloudMatchValue,
         "enablePersistingInGameSettings": settings.persistInGameSettings,
         "requestedStreamingFeatures": [
