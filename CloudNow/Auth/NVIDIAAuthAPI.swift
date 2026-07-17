@@ -3,11 +3,11 @@ import Foundation
 import os.log
 import Security
 
-private let authLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "Auth")
+private nonisolated let authLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "Auth")
 
 // MARK: - Constants
 
-enum NVIDIAAuth {
+nonisolated enum NVIDIAAuth {
     static let authEndpoint = "https://login.nvidia.com/authorize"
     static let tokenEndpoint = "https://login.nvidia.com/token"
     static let deviceAuthorizeEndpoint = "https://login.nvidia.com/device/authorize"
@@ -32,7 +32,7 @@ enum NVIDIAAuth {
     static let userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 NVIDIACEFClient/HEAD/debb5919f6 GFN-PC/\(gfnClientVersion)"
 }
 
-enum GFNDeviceIdentity {
+nonisolated enum GFNDeviceIdentity {
     private static let defaultsKey = "gfn.stableDeviceId"
 
     static func stableDeviceId() -> String {
@@ -48,7 +48,7 @@ enum GFNDeviceIdentity {
 
 // MARK: - PKCE Helpers
 
-struct PKCE {
+nonisolated struct PKCE {
     let verifier: String
     let challenge: String
 
@@ -74,7 +74,7 @@ struct PKCE {
 
 // MARK: - Keychain
 
-enum KeychainService {
+nonisolated enum KeychainService {
     private static let service = "com.owenselles.CloudNow"
     private static let account = "gfn-auth-session"
 
@@ -131,7 +131,7 @@ enum KeychainService {
 
 // MARK: - Response Models
 
-struct AuthTokens: Codable {
+nonisolated struct AuthTokens: Codable {
     var accessToken: String
     var refreshToken: String?
     var idToken: String?
@@ -148,7 +148,7 @@ struct AuthTokens: Codable {
     }
 }
 
-struct AuthUser: Codable {
+nonisolated struct AuthUser: Codable {
     let userId: String
     let displayName: String
     let email: String?
@@ -156,7 +156,7 @@ struct AuthUser: Codable {
     var membershipTier: String
 }
 
-struct DeviceFlowResponse: Codable {
+nonisolated struct DeviceFlowResponse: Codable {
     let userCode: String
     let deviceCode: String
     let verificationUri: String
@@ -165,7 +165,7 @@ struct DeviceFlowResponse: Codable {
     let interval: Int
 }
 
-struct LoginProvider: Codable {
+nonisolated struct LoginProvider: Codable {
     let idpId: String
     let code: String
     let displayName: String
@@ -281,10 +281,14 @@ actor NVIDIAAuthAPI {
             request.httpBody = body.data(using: .utf8)
             let (data, response) = try await session.data(for: request)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if statusCode == 200 { return try parseTokenResponse(data) }
+            if statusCode == 200 {
+                return try parseTokenResponse(data)
+            }
             let responseBody = String(data: data, encoding: .utf8) ?? "(empty)"
             lastError = AuthError.clientTokenFailed("HTTP \(statusCode): \(responseBody)")
-            if statusCode < 400 || statusCode >= 500 { throw lastError }
+            if statusCode < 400 || statusCode >= 500 {
+                throw lastError
+            }
             // 4xx with clientID mismatch → try next clientID
         }
         throw lastError
@@ -358,7 +362,9 @@ actor NVIDIAAuthAPI {
     func fetchUserInfo(tokens: AuthTokens) async throws -> AuthUser {
         // Try JWT payload first (fast path)
         let jwt = tokens.idToken ?? tokens.accessToken
-        if let user = parseUserFromJWT(jwt) { return user }
+        if let user = parseUserFromJWT(jwt) {
+            return user
+        }
 
         var request = URLRequest(url: URL(string: NVIDIAAuth.userinfoEndpoint)!)
         request.setValue("Bearer \(tokens.accessToken)", forHTTPHeaderField: "Authorization")
@@ -421,7 +427,7 @@ actor NVIDIAAuthAPI {
 
 // MARK: - Codable Response Types
 
-private struct ServiceUrlsResponse: Decodable {
+private nonisolated struct ServiceUrlsResponse: Decodable {
     let gfnServiceInfo: GFNServiceInfo?
     struct GFNServiceInfo: Decodable {
         let gfnServiceEndpoints: [Endpoint]?
@@ -435,7 +441,7 @@ private struct ServiceUrlsResponse: Decodable {
     }
 }
 
-private struct TokenResponse: Decodable {
+private nonisolated struct TokenResponse: Decodable {
     let access_token: String
     let refresh_token: String?
     let id_token: String?
@@ -444,18 +450,18 @@ private struct TokenResponse: Decodable {
     let client_token_expires_in: Int?
 }
 
-private struct ClientTokenResponse: Decodable {
+private nonisolated struct ClientTokenResponse: Decodable {
     let client_token: String
     let expires_in: Int?
 }
 
-private struct UserinfoResponse: Decodable {
+private nonisolated struct UserinfoResponse: Decodable {
     let sub: String
     let preferred_username: String?
     let email: String?
 }
 
-private struct DeviceFlowErrorResponse: Decodable {
+private nonisolated struct DeviceFlowErrorResponse: Decodable {
     let error: String
     let errorDescription: String?
     enum CodingKeys: String, CodingKey {
@@ -464,7 +470,7 @@ private struct DeviceFlowErrorResponse: Decodable {
     }
 }
 
-private struct JWTPayload: Decodable {
+private nonisolated struct JWTPayload: Decodable {
     let sub: String?
     let email: String?
     let preferred_username: String?

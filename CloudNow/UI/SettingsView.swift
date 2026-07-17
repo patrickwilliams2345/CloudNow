@@ -218,17 +218,23 @@ struct SettingsView: View {
                         LabeledContent {
                             HStack(spacing: 16) {
                                 Button {
-                                    vm.streamSettings.rumbleIntensity = max(StreamSettings.minRumbleIntensity, vm.streamSettings.rumbleIntensity - 0.05)
+                                    vm.streamSettings.rumbleIntensity = max(
+                                        StreamSettings.minRumbleIntensity,
+                                        vm.streamSettings.rumbleIntensity - 0.05
+                                    )
                                 } label: {
                                     Image(systemName: "minus.circle")
                                 }
                                 .buttonStyle(.plain)
-                                Text("\(Int((vm.streamSettings.rumbleIntensity * 100).rounded()))%")
+                                Text(rumbleMultiplierLabel(vm.streamSettings.rumbleIntensity))
                                     .monospacedDigit()
-                                    .frame(minWidth: 44)
+                                    .frame(minWidth: 64)
                                     .padding(.horizontal, 24)
                                 Button {
-                                    vm.streamSettings.rumbleIntensity = min(StreamSettings.maxRumbleIntensity, vm.streamSettings.rumbleIntensity + 0.05)
+                                    vm.streamSettings.rumbleIntensity = min(
+                                        StreamSettings.maxRumbleIntensity,
+                                        vm.streamSettings.rumbleIntensity + 0.05
+                                    )
                                 } label: {
                                     Image(systemName: "plus.circle")
                                 }
@@ -295,9 +301,9 @@ struct SettingsView: View {
                         .padding(.vertical, 8)
                     }
                     Picker(selection: $vm.streamSettings.defaultRemoteInputMode) {
-                        Text(L10n.remoteInputModeLabel(.mouse)).tag(RemoteInputMode.mouse)
                         Text(L10n.remoteInputModeLabel(.gamepad)).tag(RemoteInputMode.gamepad)
                         Text(L10n.remoteInputModeLabel(.dualsense)).tag(RemoteInputMode.dualsense)
+                        Text(L10n.remoteInputModeLabel(.gamepadMouse)).tag(RemoteInputMode.gamepadMouse)
                     } label: {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(L10n.text("default_input_mode"))
@@ -332,33 +338,35 @@ struct SettingsView: View {
                     }
                 }
 
-                Section(L10n.text("diagnostics")) {
-                    Toggle(isOn: $vm.streamSettings.diagnosticsEnabled) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(L10n.text("diagnostic"))
-                            Text(L10n.text("adds_receiver_timing_renderer_metrics_frame_counters_and_instruments_signposts"))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                #if DEBUG
+                    Section(L10n.text("diagnostics")) {
+                        Toggle(isOn: $vm.streamSettings.diagnosticsEnabled) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(L10n.text("diagnostic"))
+                                Text(L10n.text("adds_receiver_timing_renderer_metrics_frame_counters_and_instruments_signposts"))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 8)
                         }
-                        .padding(.vertical, 8)
-                    }
-                    .onChange(of: vm.streamSettings.diagnosticsEnabled) { _, enabled in
-                        if !enabled {
-                            vm.streamSettings.enableRtcEventLog = false
+                        .onChange(of: vm.streamSettings.diagnosticsEnabled) { _, enabled in
+                            if !enabled {
+                                vm.streamSettings.enableRtcEventLog = false
+                            }
                         }
-                    }
 
-                    Toggle(isOn: $vm.streamSettings.enableRtcEventLog) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(L10n.text("rtc_event_log"))
-                            Text(L10n.text("rtc_event_log_description"))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                        Toggle(isOn: $vm.streamSettings.enableRtcEventLog) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(L10n.text("rtc_event_log"))
+                                Text(L10n.text("rtc_event_log_description"))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 8)
                         }
-                        .padding(.vertical, 8)
+                        .disabled(!vm.streamSettings.diagnosticsEnabled)
                     }
-                    .disabled(!vm.streamSettings.diagnosticsEnabled)
-                }
+                #endif
 
                 Section(L10n.text("account")) {
                     if let user = authManager.session?.user {
@@ -397,6 +405,10 @@ struct SettingsView: View {
         // Extract zone ID from URL like "https://np-aws-us-n-virginia-1.cloudmatchbeta.nvidiagrid.net/"
         let host = URL(string: url)?.host ?? url
         return host.components(separatedBy: ".").first?.uppercased() ?? url
+    }
+
+    private func rumbleMultiplierLabel(_ value: Double) -> String {
+        String(format: "%.2f×", value)
     }
 
     private struct ResolutionEntry { let res: String; let badge: String; let symbol: String }
@@ -538,11 +550,14 @@ private struct ZonePickerView: View {
         do {
             zones = try await ZoneClient.shared.fetchZones()
             isLoading = false
+            let staleZones = zones.filter(\.isMeasuring)
             let batchSize = 6
-            for start in stride(from: 0, to: zones.count, by: batchSize) {
-                if Task.isCancelled { return }
-                let end = min(start + batchSize, zones.count)
-                let batch = zones[start ..< end]
+            for start in stride(from: 0, to: staleZones.count, by: batchSize) {
+                if Task.isCancelled {
+                    return
+                }
+                let end = min(start + batchSize, staleZones.count)
+                let batch = staleZones[start ..< end]
                 await withTaskGroup(of: (String, Int?).self) { group in
                     for zone in batch {
                         group.addTask {
@@ -551,7 +566,9 @@ private struct ZonePickerView: View {
                         }
                     }
                     for await (id, ping) in group {
-                        if Task.isCancelled { return }
+                        if Task.isCancelled {
+                            return
+                        }
                         if let idx = zones.firstIndex(where: { $0.id == id }) {
                             zones[idx].pingMs = ping
                             zones[idx].isMeasuring = false
@@ -567,16 +584,28 @@ private struct ZonePickerView: View {
     }
 
     private func queueColor(_ q: Int) -> Color {
-        if q <= 5 { return .green }
-        if q <= 15 { return .yellow }
-        if q <= 30 { return .orange }
+        if q <= 5 {
+            return .green
+        }
+        if q <= 15 {
+            return .yellow
+        }
+        if q <= 30 {
+            return .orange
+        }
         return .red
     }
 
     private func pingColor(_ ms: Int) -> Color {
-        if ms < 30 { return .green }
-        if ms < 80 { return .yellow }
-        if ms < 150 { return .orange }
+        if ms < 30 {
+            return .green
+        }
+        if ms < 80 {
+            return .yellow
+        }
+        if ms < 150 {
+            return .orange
+        }
         return .red
     }
 }

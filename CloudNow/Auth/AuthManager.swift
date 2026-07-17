@@ -7,7 +7,7 @@ private let authLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "A
 
 // MARK: - AuthSession (persisted)
 
-struct AuthSession: Codable {
+nonisolated struct AuthSession: Codable {
     var provider: LoginProvider
     var tokens: AuthTokens
     var user: AuthUser
@@ -22,6 +22,12 @@ enum LoginPhase: Equatable {
     case failed(String)
 }
 
+enum AuthStartupPhase: Equatable {
+    case pending
+    case restoringSession
+    case ready
+}
+
 // MARK: - AuthManager
 
 @Observable
@@ -29,12 +35,14 @@ enum LoginPhase: Equatable {
 final class AuthManager {
     private(set) var session: AuthSession?
     private(set) var loginPhase: LoginPhase = .idle
+    private(set) var startupPhase: AuthStartupPhase = .pending
 
     var isAuthenticated: Bool {
         session != nil
     }
 
     private let api = NVIDIAAuthAPI()
+    private let persistence = AppPersistenceStore.shared
     private var loginTask: Task<Void, Never>?
     private var activeRefreshTask: Task<AuthSession, Error>?
     private var refreshTimer: Task<Void, Never>?
@@ -44,12 +52,18 @@ final class AuthManager {
     // MARK: Lifecycle
 
     func initialize() async {
-        guard let stored = try? KeychainService.load(),
-              let saved = try? JSONDecoder().decode(AuthSession.self, from: stored)
-        else { return }
+        guard startupPhase == .pending else { return }
+        startupPhase = .restoringSession
+
+        guard let saved = try? await persistence.loadAuthSession() else {
+            startupPhase = .ready
+            return
+        }
+
         session = saved
         scheduleProactiveRefresh()
         scheduleBackgroundRefresh()
+        startupPhase = .ready
         await refreshIfNeeded()
     }
 
@@ -111,8 +125,12 @@ final class AuthManager {
                         let savedRefreshToken = tokens.refreshToken // preserve device-flow refreshToken
                         let savedIdToken = tokens.idToken // preserve device-flow idToken
                         tokens = rebound
-                        if tokens.refreshToken == nil { tokens.refreshToken = savedRefreshToken }
-                        if tokens.idToken == nil { tokens.idToken = savedIdToken }
+                        if tokens.refreshToken == nil {
+                            tokens.refreshToken = savedRefreshToken
+                        }
+                        if tokens.idToken == nil {
+                            tokens.idToken = savedIdToken
+                        }
                         // Re-fetch clientToken for the re-bound session
                         if let ct2 = try? await api.fetchClientToken(accessToken: tokens.accessToken) {
                             tokens.clientToken = ct2.token
@@ -121,11 +139,12 @@ final class AuthManager {
                     }
                 }
 
+                try Task.checkCancellation()
                 let newSession = AuthSession(provider: selectedProvider, tokens: tokens, user: user)
                 session = newSession
                 scheduleProactiveRefresh()
                 scheduleBackgroundRefresh()
-                try persist(newSession)
+                try await persist(newSession)
                 loginPhase = .idle
             } catch is CancellationError {
                 loginPhase = .idle
@@ -144,10 +163,14 @@ final class AuthManager {
     // MARK: Logout
 
     func logout() {
+        loginTask?.cancel()
+        loginTask = nil
+        activeRefreshTask?.cancel()
+        activeRefreshTask = nil
         refreshTimer?.cancel()
         session = nil
         loginPhase = .idle
-        KeychainService.delete()
+        Task { await persistence.deleteAuthSession() }
     }
 
     // MARK: Token Refresh
@@ -184,15 +207,13 @@ final class AuthManager {
     func refreshIfNeeded() async {
         guard let s = session, s.tokens.isNearExpiry else { return }
         do {
-            let refreshed = try await refresh(session: s)
-            session = refreshed
-            try? persist(refreshed)
+            _ = try await refresh(session: s)
         } catch {
             if s.tokens.isExpired {
                 authLog.error("[Auth] Token expired and refresh failed: \(error, privacy: .private) — clearing session, re-login required")
                 refreshTimer?.cancel()
                 session = nil
-                KeychainService.delete()
+                await persistence.deleteAuthSession()
             } else {
                 authLog.warning("[Auth] Refresh failed but token still valid (\(Int(s.tokens.expiresAt.timeIntervalSinceNow), privacy: .public)s left) — keeping session")
             }
@@ -239,7 +260,9 @@ final class AuthManager {
                 authLog.warning("[Auth] client_token grant did not return a refreshToken — preserving previous one")
                 updated.tokens.refreshToken = savedRefreshToken
             }
-            if updated.tokens.idToken == nil { updated.tokens.idToken = savedIdToken }
+            if updated.tokens.idToken == nil {
+                updated.tokens.idToken = savedIdToken
+            }
         } else if let refreshToken = s.tokens.refreshToken {
             authLog.warning("[Auth] client_token path unavailable or failed, falling back to refresh_token grant")
             let savedRefreshToken = updated.tokens.refreshToken
@@ -249,7 +272,9 @@ final class AuthManager {
                 authLog.warning("[Auth] refresh_token grant did not return a new refreshToken — preserving previous one")
                 updated.tokens.refreshToken = savedRefreshToken
             }
-            if updated.tokens.idToken == nil { updated.tokens.idToken = savedIdToken }
+            if updated.tokens.idToken == nil {
+                updated.tokens.idToken = savedIdToken
+            }
             authLog.info("[Auth] refresh via refresh_token grant succeeded")
         } else if let idToken = s.tokens.idToken {
             // Third path: the idToken is a longer-lived JWT (typically 30 days) that NVIDIA
@@ -278,7 +303,9 @@ final class AuthManager {
                 updated.tokens.refreshToken = savedRefreshToken
             }
             // Preserve the idToken used for bootstrap so we can re-use it on the next cycle
-            if updated.tokens.idToken == nil { updated.tokens.idToken = idToken }
+            if updated.tokens.idToken == nil {
+                updated.tokens.idToken = idToken
+            }
         } else {
             authLog.error("[Auth] refresh failed: no usable clientToken, refreshToken, or idToken available")
             throw AuthError.tokenRefreshFailed("All refresh mechanisms exhausted.")
@@ -292,10 +319,11 @@ final class AuthManager {
         } catch {
             authLog.warning("[Auth] warning: failed to re-bootstrap client_token after refresh: \(error, privacy: .private)")
         }
+        try Task.checkCancellation()
         session = updated
         scheduleProactiveRefresh()
         scheduleBackgroundRefresh()
-        try persist(updated)
+        try await persist(updated)
         return updated
     }
 
@@ -323,8 +351,7 @@ final class AuthManager {
         try? BGTaskScheduler.shared.submit(request)
     }
 
-    private func persist(_ s: AuthSession) throws {
-        let data = try JSONEncoder().encode(s)
-        try KeychainService.save(data)
+    private func persist(_ s: AuthSession) async throws {
+        try await persistence.saveAuthSession(s)
     }
 }

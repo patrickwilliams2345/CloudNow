@@ -1,7 +1,7 @@
 import Foundation
 import os.log
 
-private let zoneLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "Zones")
+private nonisolated let zoneLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "Zones")
 
 // MARK: - Zone Model
 
@@ -100,7 +100,9 @@ actor ZoneClient {
         _ = await headProbe(url) // warm-up
         var samples: [Double] = []
         for _ in 0 ..< 2 {
-            if let ms = await headProbe(url) { samples.append(ms) }
+            if let ms = await headProbe(url) {
+                samples.append(ms)
+            }
         }
         guard !samples.isEmpty else { return nil }
         let ping = samples.reduce(0, +) / Double(samples.count)
@@ -114,12 +116,12 @@ actor ZoneClient {
     }
 
     /// Refreshes zone queue data and stale latency probes without delaying game launch.
-    func prewarmAutomaticRouting() async {
+    func prewarmAutomaticRouting() async -> [GFNZone] {
         let now = Date()
         guard !isPrewarming,
               lastPrewarmAt.map({ now.timeIntervalSince($0) >= Self.prewarmInterval }) ?? true
         else {
-            return
+            return await (try? fetchZones()) ?? []
         }
 
         isPrewarming = true
@@ -151,8 +153,10 @@ actor ZoneClient {
                 }
                 cacheAutomaticSelections(from: zones)
             }
+            return zones
         } catch {
             zoneLog.warning("[Zone] Automatic routing prewarm failed: \(error, privacy: .private)")
+            return []
         }
     }
 
@@ -289,7 +293,9 @@ extension [GFNZone] {
     /// secondary penalty so a distant empty zone cannot beat a nearby busy one.
     nonisolated func autoZone(isUnlimited: Bool = false) -> GFNZone? {
         guard !isEmpty else { return nil }
-        if isUnlimited { return closestZone }
+        if isUnlimited {
+            return closestZone
+        }
         let measured = filter { $0.pingMs != nil }
         guard !measured.isEmpty else { return self.min { $0.queuePosition < $1.queuePosition } }
         return measured.min {

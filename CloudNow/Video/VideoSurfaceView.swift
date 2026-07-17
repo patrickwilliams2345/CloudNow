@@ -1,11 +1,12 @@
 // NOTE: Requires WebRTC SPM package (https://github.com/livekit/webrtc-xcframework)
 
 import AVFoundation
-import LiveKitWebRTC
+@preconcurrency import CoreVideo
+@preconcurrency import LiveKitWebRTC
 import os
 import UIKit
 
-private let videoLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "Video")
+private nonisolated let videoLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "Video")
 
 // MARK: - VideoSurfaceView
 
@@ -42,9 +43,12 @@ final class VideoSurfaceView: UIView {
     /// the press bubble up to the system (which opens the Apple TV control center).
     var menuPressHandler: (() -> Void)?
 
-    var onDecodedVideoFormatChanged: ((DecodedVideoFormat) -> Void)? {
+    var onDecodedVideoFormatChanged: (@Sendable (DecodedVideoFormat) -> Void)? {
         didSet {
-            renderer.onDecodedVideoFormatChanged = onDecodedVideoFormatChanged
+            let handler = onDecodedVideoFormatChanged
+            renderer.onDecodedVideoFormatChanged = { format in
+                handler?(format)
+            }
         }
     }
 
@@ -52,7 +56,9 @@ final class VideoSurfaceView: UIView {
     /// (e.g. Options mapping to .playPause) are suppressed to avoid double-firing the overlay.
     var gamepadModeActive = false {
         didSet {
-            if gamepadModeActive { cancelRemoteMouseTracking() }
+            if gamepadModeActive {
+                cancelRemoteMouseTracking()
+            }
         }
     }
 
@@ -60,7 +66,9 @@ final class VideoSurfaceView: UIView {
     /// .menu press should close the overlay or be silently consumed.
     var overlayVisible: Bool = false {
         didSet {
-            if overlayVisible { cancelRemoteMouseTracking() }
+            if overlayVisible {
+                cancelRemoteMouseTracking()
+            }
         }
     }
 
@@ -132,7 +140,7 @@ final class VideoSurfaceView: UIView {
         ]
     }
 
-    deinit {
+    isolated deinit {
         notificationTokens.forEach(NotificationCenter.default.removeObserver)
     }
 
@@ -178,7 +186,9 @@ final class VideoSurfaceView: UIView {
                 handled = true
             }
         }
-        if !handled { super.pressesBegan(presses, with: event) }
+        if !handled {
+            super.pressesBegan(presses, with: event)
+        }
     }
 
     override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
@@ -197,7 +207,9 @@ final class VideoSurfaceView: UIView {
                 handled = true
             }
         }
-        if !handled { super.pressesEnded(presses, with: event) }
+        if !handled {
+            super.pressesEnded(presses, with: event)
+        }
     }
 
     override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
@@ -302,7 +314,7 @@ final class VideoSurfaceView: UIView {
 
 /// Implements LKRTCVideoRenderer to receive decoded WebRTC frames and feed them
 /// to the display layer's background-safe AVSampleBufferVideoRenderer.
-private final class WebRTCFrameRenderer: NSObject, LKRTCVideoRenderer {
+private final nonisolated class WebRTCFrameRenderer: NSObject, LKRTCVideoRenderer, @unchecked Sendable {
     private struct FlushRequest {
         let generation: UInt64
         let removeDisplayedImage: Bool
@@ -320,7 +332,7 @@ private final class WebRTCFrameRenderer: NSObject, LKRTCVideoRenderer {
     }
 
     var sampleBufferRenderer: AVSampleBufferVideoRenderer?
-    var onDecodedVideoFormatChanged: ((DecodedVideoFormat) -> Void)?
+    var onDecodedVideoFormatChanged: (@Sendable (DecodedVideoFormat) -> Void)?
     private let diagnostics: VideoPipelineDiagnostics
     private let state = OSAllocatedUnfairLock(initialState: State())
     private let i420Converter = I420FrameConverter()
@@ -508,7 +520,9 @@ private final class WebRTCFrameRenderer: NSObject, LKRTCVideoRenderer {
         }
         guard didBeginFlush else { return }
 
-        if recordFailure { diagnostics.recordRendererFailure() }
+        if recordFailure {
+            diagnostics.recordRendererFailure()
+        }
         if let requestToRun {
             performFlush(requestToRun)
         }
@@ -537,21 +551,24 @@ private final class WebRTCFrameRenderer: NSObject, LKRTCVideoRenderer {
         for pixelBuffer: CVPixelBuffer,
         signature: VideoFormatSignature
     ) -> CMVideoFormatDescription? {
-        state.withLock { state in
-            if let cached = state.formatDescription,
-               state.formatSignature == signature,
-               CMVideoFormatDescriptionMatchesImageBuffer(cached, imageBuffer: pixelBuffer)
-            {
-                return cached
-            }
+        let (generation, cached) = state.withLock {
+            ($0.generation, $0.formatSignature == signature ? $0.formatDescription : nil)
+        }
+        if let cached,
+           CMVideoFormatDescriptionMatchesImageBuffer(cached, imageBuffer: pixelBuffer)
+        {
+            return cached
+        }
 
-            var created: CMVideoFormatDescription?
-            let status = CMVideoFormatDescriptionCreateForImageBuffer(
-                allocator: nil,
-                imageBuffer: pixelBuffer,
-                formatDescriptionOut: &created
-            )
-            guard status == noErr else { return nil }
+        var created: CMVideoFormatDescription?
+        let status = CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: nil,
+            imageBuffer: pixelBuffer,
+            formatDescriptionOut: &created
+        )
+        guard status == noErr, let created else { return nil }
+        return state.withLock { state in
+            guard state.generation == generation, !state.isFlushing else { return nil }
             state.formatDescription = created
             state.formatSignature = signature
             return created

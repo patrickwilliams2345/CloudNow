@@ -2,14 +2,14 @@ import Foundation
 import Network
 import os
 
-private let signalingLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "Signaling")
+private nonisolated let signalingLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "Signaling")
 /// Same subsystem/category as signalingLog, used only for `isEnabled(type:)` so the
 /// outgoing-message serialization is skipped unless debug logging is on.
-private let signalingOSLog = OSLog(subsystem: "com.owenselles.CloudNow2", category: "Signaling")
+private nonisolated let signalingOSLog = OSLog(subsystem: "com.owenselles.CloudNow2", category: "Signaling")
 
 // MARK: - Signaling Events
 
-enum SignalingEvent {
+nonisolated enum SignalingEvent {
     case connected
     case disconnected(reason: String)
     case offer(sdp: String)
@@ -19,6 +19,23 @@ enum SignalingEvent {
 }
 
 // MARK: - GFN Signaling Client
+
+private final nonisolated class SignalingContinuationGate: Sendable {
+    private let hasResumed = OSAllocatedUnfairLock(initialState: false)
+
+    func run(_ action: @Sendable () -> Void) {
+        let isFirst = hasResumed.withLock { resumed in
+            if resumed {
+                return false
+            }
+            resumed = true
+            return true
+        }
+        if isFirst {
+            action()
+        }
+    }
+}
 
 //
 // Uses NWConnection + NWProtocolWebSocket (system WebSocket) so Apple handles the HTTP/1.1
@@ -162,7 +179,9 @@ final class GFNSignalingClient {
 
     func sendAnswer(sdp: String, nvstSdp: String? = nil) {
         var payload: [String: Any] = ["type": "answer", "sdp": sdp]
-        if let nvstSdp { payload["nvstSdp"] = nvstSdp }
+        if let nvstSdp {
+            payload["nvstSdp"] = nvstSdp
+        }
         sendJson([
             "peer_msg": ["from": localPeerId, "to": remotePeerId, "msg": jsonString(payload)],
             "ackid": nextAckId(),
@@ -177,8 +196,12 @@ final class GFNSignalingClient {
             return
         }
         var payload: [String: Any] = ["candidate": candidate]
-        if let sdpMid { payload["sdpMid"] = sdpMid }
-        if let sdpMLineIndex { payload["sdpMLineIndex"] = sdpMLineIndex }
+        if let sdpMid {
+            payload["sdpMid"] = sdpMid
+        }
+        if let sdpMLineIndex {
+            payload["sdpMLineIndex"] = sdpMLineIndex
+        }
         sendJson([
             "peer_msg": ["from": localPeerId, "to": remotePeerId, "msg": jsonString(payload)],
             "ackid": nextAckId(),
@@ -270,15 +293,21 @@ final class GFNSignalingClient {
             let (chunk, opcode, isComplete) = try await withCheckedThrowingContinuation {
                 (cont: CheckedContinuation<(Data?, NWProtocolWebSocket.Opcode?, Bool), Error>) in
                 conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { content, context, isComplete, error in
-                    if let error { cont.resume(throwing: error); return }
+                    if let error {
+                        cont.resume(throwing: error); return
+                    }
                     let meta = context?.protocolMetadata(definition: NWProtocolWebSocket.definition)
                         as? NWProtocolWebSocket.Metadata
                     cont.resume(returning: (content, meta?.opcode, isComplete))
                 }
             }
 
-            if let data = chunk { buffer.append(data) }
-            if messageOpcode == nil, let op = opcode { messageOpcode = op }
+            if let data = chunk {
+                buffer.append(data)
+            }
+            if messageOpcode == nil, let op = opcode {
+                messageOpcode = op
+            }
             guard isComplete else { continue } // more chunks coming for this message
 
             switch messageOpcode {
@@ -317,7 +346,9 @@ final class GFNSignalingClient {
         let ctx = NWConnection.ContentContext(identifier: "ws-text", metadata: [meta])
         conn.send(content: data, contentContext: ctx, isComplete: true,
                   completion: .contentProcessed { err in
-                      if let err { signalingLog.warning("[Signaling] Send error: \(err, privacy: .private)") }
+                      if let err {
+                          signalingLog.warning("[Signaling] Send error: \(err, privacy: .private)")
+                      }
                   })
     }
 
@@ -342,7 +373,9 @@ final class GFNSignalingClient {
         // ACK
         if let ackId = obj["ackid"] as? Int {
             let shouldAck = (obj["peer_info"] as? [String: Any])?["id"] as? Int != localPeerId
-            if shouldAck { sendJson(["ack": ackId]) }
+            if shouldAck {
+                sendJson(["ack": ackId])
+            }
         }
 
         // Heartbeat
@@ -481,15 +514,7 @@ final class GFNSignalingClient {
         // when the candidate race is decided, the losers' cancel can arrive while (or
         // right after) their own .ready fires — on a concurrent queue that double-resumed
         // the continuation and crashed.
-        let hasResumed = OSAllocatedUnfairLock(initialState: false)
-        @Sendable func resumeOnce(_ resume: () -> Void) {
-            let isFirst = hasResumed.withLock { resumed in
-                if resumed { return false }
-                resumed = true
-                return true
-            }
-            if isFirst { resume() }
-        }
+        let continuationGate = SignalingContinuationGate()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 connection.stateUpdateHandler = { state in
@@ -497,20 +522,20 @@ final class GFNSignalingClient {
                     case .ready:
                         connection.stateUpdateHandler = nil
                         signalingLog.info("[Signaling] Connected (WebSocket ready) via \(candidateHost, privacy: .private)")
-                        resumeOnce { continuation.resume() }
+                        continuationGate.run { continuation.resume() }
                     case let .failed(error):
                         connection.stateUpdateHandler = nil
                         signalingLog.warning("[Signaling] Connection failed (\(candidateHost, privacy: .private)): \(error, privacy: .private)")
-                        resumeOnce { continuation.resume(throwing: error) }
+                        continuationGate.run { continuation.resume(throwing: error) }
                     case .cancelled:
                         connection.stateUpdateHandler = nil
-                        resumeOnce { continuation.resume(throwing: SignalingError.cancelled) }
+                        continuationGate.run { continuation.resume(throwing: SignalingError.cancelled) }
                     case let .waiting(error):
                         let description = "\(error)"
                         if description.contains("53") || description.contains("ECONNABORTED") {
                             connection.stateUpdateHandler = nil
                             connection.cancel()
-                            resumeOnce { continuation.resume(throwing: error) }
+                            continuationGate.run { continuation.resume(throwing: error) }
                         }
                     default:
                         break
@@ -550,7 +575,9 @@ final class GFNSignalingClient {
                                    &buf, socklen_t(NI_MAXHOST), nil, 0, NI_NUMERICHOST) == 0
                     {
                         let ip = String(cString: buf)
-                        if !ips.contains(ip) { ips.append(ip) }
+                        if !ips.contains(ip) {
+                            ips.append(ip)
+                        }
                     }
                     cur = info.pointee.ai_next
                 }
@@ -562,7 +589,7 @@ final class GFNSignalingClient {
 
 // MARK: - Errors
 
-enum SignalingError: Error {
+nonisolated enum SignalingError: Error {
     case invalidUrl(String)
     case handshakeFailed(String)
     case remoteClosed
