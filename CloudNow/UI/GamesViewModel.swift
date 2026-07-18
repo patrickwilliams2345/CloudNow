@@ -130,11 +130,11 @@ class GamesViewModel {
     var resumableSession: ResumableSession?
     /// Last created session, persisted so we can resume/stop it across app launches.
     var lastSession: LastSessionRecord?
-    /// Top 5 lowest-latency zones, populated on launch.
-    var topZones: [GFNZone] = []
-
     var librarySearchText = "" {
-        didSet { rebuildFilteredLibraryGames() }
+        didSet {
+            rebuildLibraryFilterBaseCount()
+            rebuildFilteredLibraryGames()
+        }
     }
 
     var librarySortOrder: LibrarySortOrder = .default {
@@ -146,7 +146,10 @@ class GamesViewModel {
     }
 
     var storeSearchText = "" {
-        didSet { rebuildFilteredStoreGames() }
+        didSet {
+            rebuildStoreFilterBaseCount()
+            rebuildFilteredStoreGames()
+        }
     }
 
     var storeSortOrder: LibrarySortOrder = .default {
@@ -161,10 +164,12 @@ class GamesViewModel {
         games: [], favoriteIds: [], context: .library
     )
     private(set) var filteredLibraryGames: [GameInfo] = []
+    private(set) var libraryFilterBaseCount = 0
     private(set) var storeFilterOptions = GameFilterOptions(
         games: [], favoriteIds: [], context: .store
     )
     private(set) var filteredStoreGames: [GameInfo] = []
+    private(set) var storeFilterBaseCount = 0
 
     private let gamesClient = GamesClient()
     private let cloudMatchClient = CloudMatchClient()
@@ -594,7 +599,18 @@ class GamesViewModel {
             favoriteIds: favoriteIds,
             context: .library
         )
+        rebuildLibraryFilterBaseCount()
         rebuildFilteredLibraryGames()
+    }
+
+    private func rebuildLibraryFilterBaseCount() {
+        libraryFilterBaseCount = GameFilterEngine.count(
+            in: libraryGames,
+            context: .library,
+            state: GameFilterState(),
+            searchText: librarySearchText,
+            favoriteIds: favoriteIds
+        )
     }
 
     private func rebuildFilteredLibraryGames() {
@@ -613,7 +629,18 @@ class GamesViewModel {
             favoriteIds: favoriteIds,
             context: .store
         )
+        rebuildStoreFilterBaseCount()
         rebuildFilteredStoreGames()
+    }
+
+    private func rebuildStoreFilterBaseCount() {
+        storeFilterBaseCount = GameFilterEngine.count(
+            in: mainGames,
+            context: .store,
+            state: GameFilterState(),
+            searchText: storeSearchText,
+            favoriteIds: favoriteIds
+        )
     }
 
     private func rebuildFilteredStoreGames() {
@@ -627,23 +654,23 @@ class GamesViewModel {
     }
 
     func libraryPreviewCount(for state: GameFilterState) -> Int {
-        filteredGames(
-            libraryGames,
+        GameFilterEngine.count(
+            in: libraryGames,
             context: .library,
             state: state,
             searchText: librarySearchText,
-            sortOrder: librarySortOrder
-        ).count
+            favoriteIds: favoriteIds
+        )
     }
 
     func storePreviewCount(for state: GameFilterState) -> Int {
-        filteredGames(
-            mainGames,
+        GameFilterEngine.count(
+            in: mainGames,
             context: .store,
             state: state,
             searchText: storeSearchText,
-            sortOrder: storeSortOrder
-        ).count
+            favoriteIds: favoriteIds
+        )
     }
 
     private func filteredGames(
@@ -799,7 +826,6 @@ class GamesViewModel {
         subscription = nil
         resumableSession = nil
         lastSession = nil
-        topZones = []
         currentVpcId = nil
         latestNetworkLibraryGames = nil
         hasCompletedInitialLoad = false
@@ -820,41 +846,5 @@ class GamesViewModel {
         if !fpsValues.contains(streamSettings.fps), let fallbackFPS = fpsValues.last {
             streamSettings.fps = fallbackFPS
         }
-    }
-
-    // MARK: Zone Auto-Selection
-
-    func measureTopZones() async {
-        let measured = await ZoneClient.shared.prewarmAutomaticRouting()
-        let reachable = measured.filter { $0.pingMs != nil }
-        let isUnlimited = subscription?.isUnlimited ?? false
-        topZones = Array(reachable
-            .sorted { autoZoneScore($0, maxPing: reachable, maxQueue: reachable, isUnlimited: isUnlimited) <
-                autoZoneScore($1, maxPing: reachable, maxQueue: reachable, isUnlimited: isUnlimited)
-            }
-            .prefix(5))
-        let measuredTop = topZones
-        gamesLog.info("[Zones] top 5: \(measuredTop.map { "\($0.id) ping=\($0.pingMs!)ms queue=\($0.queuePosition)" }.joined(separator: ", "), privacy: .public)")
-    }
-
-    func bestZoneUrl() async -> String? {
-        let isUnlimited = subscription?.isUnlimited ?? false
-        if let cached = await ZoneClient.shared.cachedAutomaticZoneUrl(isUnlimited: isUnlimited) {
-            gamesLog.info("[Zones] using prewarmed automatic route: \(cached, privacy: .public) unlimited=\(isUnlimited, privacy: .public)")
-            return cached
-        }
-
-        // Never put fresh HTTP probes on the launch path. If prewarming has not
-        // completed yet, use its best in-memory result or preserve NVIDIA routing.
-        return topZones.autoZone(isUnlimited: isUnlimited)?.zoneUrl
-    }
-
-    private func autoZoneScore(_ zone: GFNZone, maxPing: [GFNZone], maxQueue: [GFNZone], isUnlimited: Bool) -> Double {
-        if isUnlimited {
-            return Double(zone.pingMs ?? .max)
-        }
-        let mp = Double(Swift.max(maxPing.compactMap(\.pingMs).max() ?? 1, 1))
-        let mq = Double(Swift.max(maxQueue.map(\.queuePosition).max() ?? 1, 1))
-        return (Double(zone.pingMs ?? Int(mp)) / mp) * 0.4 + (Double(zone.queuePosition) / mq) * 0.6
     }
 }
